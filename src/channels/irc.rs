@@ -337,7 +337,9 @@ impl rustls::client::danger::ServerCertVerifier for NoVerify {
     }
 
     fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
-        rustls::crypto::ring::default_provider()
+        // Use aws-lc-rs provider (configured globally in Cargo.toml)
+        // This works on RISC-V 32-bit (V821), unlike ring
+        rustls::crypto::aws_lc_rs::default_provider()
             .signature_verification_algorithms
             .supported_schemes()
     }

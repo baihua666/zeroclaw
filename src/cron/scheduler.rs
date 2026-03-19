@@ -1,9 +1,10 @@
+#[cfg(feature = "ring")]
+use crate::channels::DiscordChannel;
 #[cfg(feature = "channel-matrix")]
 use crate::channels::MatrixChannel;
-use crate::channels::{
-    Channel, DiscordChannel, MattermostChannel, SendMessage, SignalChannel, SlackChannel,
-    TelegramChannel,
-};
+#[cfg(feature = "channels-websocket")]
+use crate::channels::SlackChannel;
+use crate::channels::{Channel, MattermostChannel, SendMessage, SignalChannel, TelegramChannel};
 use crate::config::Config;
 use crate::cron::{
     due_jobs, next_run_for_schedule, record_last_run, record_run, remove_job, reschedule_after_run,
@@ -344,6 +345,7 @@ pub(crate) async fn deliver_announcement(
             );
             channel.send(&SendMessage::new(output, target)).await?;
         }
+        #[cfg(feature = "ring")]
         "discord" => {
             let dc = config
                 .channels_config
@@ -359,6 +361,11 @@ pub(crate) async fn deliver_announcement(
             );
             channel.send(&SendMessage::new(output, target)).await?;
         }
+        #[cfg(not(feature = "ring"))]
+        "discord" => {
+            anyhow::bail!("discord delivery channel requires `ring` feature");
+        }
+        #[cfg(feature = "channels-websocket")]
         "slack" => {
             let sl = config
                 .channels_config
@@ -374,6 +381,10 @@ pub(crate) async fn deliver_announcement(
             )
             .with_workspace_dir(config.workspace_dir.clone());
             channel.send(&SendMessage::new(output, target)).await?;
+        }
+        #[cfg(not(feature = "channels-websocket"))]
+        "slack" => {
+            anyhow::bail!("slack delivery channel requires `channels-websocket` feature");
         }
         "mattermost" => {
             let mm = config

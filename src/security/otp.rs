@@ -2,6 +2,7 @@ use crate::config::OtpConfig;
 use crate::security::secrets::SecretStore;
 use anyhow::{Context, Result};
 use parking_lot::Mutex;
+#[cfg(feature = "ring")]
 use ring::hmac;
 use std::collections::HashMap;
 use std::fs;
@@ -61,6 +62,7 @@ impl OtpValidator {
         self.validate_at(code, unix_timestamp_now())
     }
 
+    #[cfg(feature = "ring")]
     fn validate_at(&self, code: &str, now_secs: u64) -> Result<bool> {
         let normalized = code.trim();
         if normalized.len() != OTP_DIGITS as usize
@@ -102,6 +104,11 @@ impl OtpValidator {
         }
 
         Ok(is_valid)
+    }
+
+    #[cfg(not(feature = "ring"))]
+    fn validate_at(&self, _code: &str, _now_secs: u64) -> Result<bool> {
+        anyhow::bail!("OTP validation requires the `ring` feature")
     }
 
     pub fn otpauth_uri(&self) -> String {
@@ -161,6 +168,7 @@ fn unix_timestamp_now() -> u64 {
         .unwrap_or(0)
 }
 
+#[cfg(feature = "ring")]
 fn compute_totp_code(secret: &[u8], counter: u64) -> String {
     let key = hmac::Key::new(hmac::HMAC_SHA1_FOR_LEGACY_USE_ONLY, secret);
     let counter_bytes = counter.to_be_bytes();
@@ -175,6 +183,12 @@ fn compute_totp_code(secret: &[u8], counter: u64) -> String {
 
     let code = binary % 10_u32.pow(OTP_DIGITS);
     format!("{code:0>6}")
+}
+
+#[cfg(not(feature = "ring"))]
+fn compute_totp_code(_secret: &[u8], _counter: u64) -> String {
+    // OTP requires HMAC which is only available with ring feature
+    unimplemented!("OTP validation requires the `ring` feature")
 }
 
 fn encode_base32_secret(input: &[u8]) -> String {

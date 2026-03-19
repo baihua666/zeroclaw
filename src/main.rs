@@ -684,8 +684,13 @@ enum MemoryCommands {
 async fn main() -> Result<()> {
     // Install default crypto provider for Rustls TLS.
     // This prevents the error: "could not automatically determine the process-level CryptoProvider"
-    // when both aws-lc-rs and ring features are available (or neither is explicitly selected).
-    if let Err(e) = rustls::crypto::ring::default_provider().install_default() {
+    // when the selected build enables a provider but nothing installs it at runtime.
+    #[cfg(feature = "ring")]
+    let provider_install = rustls::crypto::ring::default_provider().install_default();
+    #[cfg(not(feature = "ring"))]
+    let provider_install = rustls::crypto::aws_lc_rs::default_provider().install_default();
+
+    if let Err(e) = provider_install {
         eprintln!("Warning: Failed to install default crypto provider: {e:?}");
     }
 

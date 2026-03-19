@@ -14,15 +14,6 @@ readme = "README.md"
 keywords = ["ai", "agent", "cli", "assistant", "chatbot"]
 categories = ["command-line-utilities", "api-bindings"]
 rust-version = "1.87"
-
-[[bin]]
-name = "zeroclaw"
-path = "src/main.rs"
-
-[lib]
-name = "zeroclaw"
-path = "src/lib.rs"
-
 include = [
   "/src/**/*",
   "/build.rs",
@@ -32,6 +23,14 @@ include = [
   "/README.md",
   "/web/dist/**/*",
 ]
+
+[[bin]]
+name = "zeroclaw"
+path = "src/main.rs"
+
+[lib]
+name = "zeroclaw"
+path = "src/lib.rs"
 
 [dependencies]
 # CLI - minimal and fast
@@ -44,7 +43,9 @@ tokio-util = { version = "0.7", default-features = false }
 tokio-stream = { version = "0.1.18", default-features = false, features = ["fs", "sync"] }
 
 # HTTP client - minimal features
-reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "blocking", "multipart", "stream", "socks"] }
+# Note: For V821, use aws-lc-rs for TLS (ring doesn't support RISC-V 32-bit)
+# Use rustls-tls-no-provider to avoid ring dependency
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls-no-provider", "blocking", "multipart", "stream", "socks"] }
 
 # Matrix client + E2EE decryption
 matrix-sdk = { version = "0.16", optional = true, default-features = false, features = ["e2e-encryption", "rustls-tls", "markdown", "sqlite"] }
@@ -113,7 +114,7 @@ parking_lot = "0.12"
 async-trait = "0.1"
 
 # HMAC-SHA256 (Zhipu/GLM JWT auth)
-ring = "0.17"
+ring = { version = "0.17", optional = true }
 
 # Protobuf encode/decode (Lark WS frame codec, WhatsApp storage)
 prost = { version = "0.14", default-features = false, features = ["derive"], optional = true }
@@ -136,18 +137,19 @@ glob = "0.3"
 which = "8.0"
 
 # WebSocket client channels (Discord/Lark/DingTalk/Nostr)
-tokio-tungstenite = { version = "0.28", features = ["rustls-tls-webpki-roots"] }
+# Note: rustls-tls feature pulls in rustls/ring, which fails on RISC-V 32-bit
+# For V821, use v821 feature which disables rustls-tls
+tokio-tungstenite = { version = "0.28", default-features = false, optional = true, features = [] }
 futures-util = { version = "0.3", default-features = false, features = ["sink"] }
 nostr-sdk = { version = "0.44", default-features = false, features = ["nip04", "nip59"], optional = true }
 regex = "1.10"
 hostname = "0.4.2"
-rustls = "0.23"
-rustls-pki-types = "1.14.0"
-tokio-rustls = "0.26.4"
 webpki-roots = "1.0.6"
+rustls-platform-verifier = { version = "0.5", default-features = false, optional = true }
 
 # email
-lettre = { version = "0.11.19", default-features = false, features = ["builder", "smtp-transport", "rustls-tls"] }
+# Keep lettre on an explicit rustls stack: runtime adapter + crypto provider + root store.
+lettre = { version = "0.11.19", default-features = false, optional = true, features = ["builder", "smtp-transport", "tokio1-rustls", "ring", "webpki-roots"] }
 mail-parser = "0.11.2"
 async-imap = { version = "0.11",features = ["runtime-tokio"], default-features = false }
 
@@ -204,8 +206,32 @@ landlock = { version = "0.4", optional = true }
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
 
+# aws-lc-rs for V821 (RISC-V 32-bit support, unlike ring)
+aws-lc-rs = { version = "1.0", optional = true }
+
+# Global rustls configuration - use aws-lc-rs instead of ring
+# This is required for RISC-V 32-bit support (V821)
+# Note: rustls 0.23+ defaults to aws-lc-rs, we just need to enable the feature
+rustls = { version = "0.23", default-features = false, features = ["aws_lc_rs", "std", "tls12"] }
+rustls-pki-types = "1.14.0"
+tokio-rustls = { version = "0.26.4", default-features = false, features = ["aws-lc-rs"] }
+
 [features]
-default = ["observability-prometheus", "channel-nostr"]
+default = ["observability-prometheus", "channel-nostr", "ring"]
+
+# V821 feature: for Allwinner V821 (RISC-V 32-bit, Tina Linux)
+# Uses aws-lc-rs for TLS (supports RISC-V 32-bit, unlike ring)
+# Disables prometheus (requires 64-bit atomics) and ring
+v821 = ["dep:aws-lc-rs"]
+
+# Ring feature: enables ring-based crypto and TLS (default, not available on RISC-V 32-bit)
+# Note: rustls and tokio-rustls are now always present but configured to use aws-lc-rs
+# tokio-tungstenite is used by QQ, Slack, Discord, DingTalk, Lark for WebSocket connections
+ring = ["dep:ring", "dep:rustls-platform-verifier", "dep:tokio-tungstenite", "dep:lettre", "channels-websocket"]
+
+# channels-websocket: enables WebSocket-based channels (QQ, Slack, Discord, DingTalk, Lark)
+channels-websocket = ["dep:tokio-tungstenite"]
+
 channel-nostr = ["dep:nostr-sdk"]
 hardware = ["nusb", "tokio-serial"]
 channel-matrix = ["dep:matrix-sdk"]
@@ -245,6 +271,11 @@ panic = "abort"      # Reduce binary size
 inherits = "release"
 codegen-units = 8    # Parallel codegen for faster builds on powerful machines (16GB+ RAM recommended)
                      # Use: cargo build --profile release-fast
+
+[profile.release-v821]
+inherits = "release"
+# Fat LTO on the V821 cross-link path is prone to linker OOM kills.
+lto = "thin"
 
 [profile.ci]
 inherits = "release"

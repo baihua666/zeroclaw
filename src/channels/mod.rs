@@ -16,9 +16,13 @@
 
 pub mod clawdtalk;
 pub mod cli;
+#[cfg(feature = "ring")]
 pub mod dingtalk;
+#[cfg(feature = "ring")]
 pub mod discord;
+#[cfg(feature = "ring")]
 pub mod email_channel;
+pub mod email_config;
 pub mod imessage;
 pub mod irc;
 #[cfg(feature = "channel-lark")]
@@ -31,9 +35,11 @@ pub mod nextcloud_talk;
 #[cfg(feature = "channel-nostr")]
 pub mod nostr;
 pub mod notion;
+#[cfg(feature = "channels-websocket")]
 pub mod qq;
 pub mod session_store;
 pub mod signal;
+#[cfg(feature = "channels-websocket")]
 pub mod slack;
 pub mod telegram;
 pub mod traits;
@@ -49,9 +55,13 @@ pub mod whatsapp_web;
 
 pub use clawdtalk::{ClawdTalkChannel, ClawdTalkConfig};
 pub use cli::CliChannel;
+#[cfg(feature = "ring")]
 pub use dingtalk::DingTalkChannel;
+#[cfg(feature = "ring")]
 pub use discord::DiscordChannel;
+#[cfg(feature = "ring")]
 pub use email_channel::EmailChannel;
+pub use email_config::EmailConfig;
 pub use imessage::IMessageChannel;
 pub use irc::IrcChannel;
 #[cfg(feature = "channel-lark")]
@@ -64,8 +74,10 @@ pub use nextcloud_talk::NextcloudTalkChannel;
 #[cfg(feature = "channel-nostr")]
 pub use nostr::NostrChannel;
 pub use notion::NotionChannel;
+#[cfg(feature = "channels-websocket")]
 pub use qq::QQChannel;
 pub use signal::SignalChannel;
+#[cfg(feature = "channels-websocket")]
 pub use slack::SlackChannel;
 pub use telegram::TelegramChannel;
 pub use traits::{Channel, SendMessage};
@@ -90,7 +102,9 @@ use crate::security::SecurityPolicy;
 use crate::tools::{self, Tool};
 use crate::util::truncate_with_ellipsis;
 use anyhow::{Context, Result};
-use portable_atomic::{AtomicU64, Ordering};
+#[cfg(target_has_atomic = "64")]
+use portable_atomic::AtomicU64;
+use portable_atomic::{AtomicU32, Ordering};
 use serde::Deserialize;
 use std::collections::{HashMap, HashSet};
 use std::fmt::Write;
@@ -3046,6 +3060,7 @@ fn build_channel_by_id(config: &Config, channel_id: &str) -> Result<Arc<dyn Chan
                 .with_workspace_dir(config.workspace_dir.clone()),
             ))
         }
+        #[cfg(feature = "ring")]
         "discord" => {
             let dc = config
                 .channels_config
@@ -3060,6 +3075,11 @@ fn build_channel_by_id(config: &Config, channel_id: &str) -> Result<Arc<dyn Chan
                 dc.mention_only,
             )))
         }
+        #[cfg(not(feature = "ring"))]
+        "discord" => {
+            anyhow::bail!("Discord channel requires `ring` feature")
+        }
+        #[cfg(feature = "channels-websocket")]
         "slack" => {
             let sl = config
                 .channels_config
@@ -3076,6 +3096,10 @@ fn build_channel_by_id(config: &Config, channel_id: &str) -> Result<Arc<dyn Chan
                 )
                 .with_workspace_dir(config.workspace_dir.clone()),
             ))
+        }
+        #[cfg(not(feature = "channels-websocket"))]
+        "slack" => {
+            anyhow::bail!("Slack channel requires `channels-websocket` feature")
         }
         other => anyhow::bail!("Unknown channel '{other}'. Supported: telegram, discord, slack"),
     }
@@ -3143,6 +3167,7 @@ fn collect_configured_channels(
         });
     }
 
+    #[cfg(feature = "ring")]
     if let Some(ref dc) = config.channels_config.discord {
         channels.push(ConfiguredChannel {
             display_name: "Discord",
@@ -3155,7 +3180,14 @@ fn collect_configured_channels(
             )),
         });
     }
+    #[cfg(not(feature = "ring"))]
+    if config.channels_config.discord.is_some() {
+        tracing::warn!(
+            "Discord channel is configured but this build was compiled without `ring` feature; skipping Discord."
+        );
+    }
 
+    #[cfg(feature = "channels-websocket")]
     if let Some(ref sl) = config.channels_config.slack {
         channels.push(ConfiguredChannel {
             display_name: "Slack",
@@ -3170,6 +3202,12 @@ fn collect_configured_channels(
                 .with_workspace_dir(config.workspace_dir.clone()),
             ),
         });
+    }
+    #[cfg(not(feature = "channels-websocket"))]
+    if config.channels_config.slack.is_some() {
+        tracing::warn!(
+            "Slack channel is configured but this build was compiled without `channels-websocket` feature; skipping Slack."
+        );
     }
 
     if let Some(ref mm) = config.channels_config.mattermost {
@@ -3318,11 +3356,18 @@ fn collect_configured_channels(
         });
     }
 
+    #[cfg(feature = "ring")]
     if let Some(ref email_cfg) = config.channels_config.email {
         channels.push(ConfiguredChannel {
             display_name: "Email",
             channel: Arc::new(EmailChannel::new(email_cfg.clone())),
         });
+    }
+    #[cfg(not(feature = "ring"))]
+    if config.channels_config.email.is_some() {
+        tracing::warn!(
+            "Email channel is configured but this build was compiled without `ring` feature; skipping Email."
+        );
     }
 
     if let Some(ref irc) = config.channels_config.irc {
@@ -3382,6 +3427,7 @@ fn collect_configured_channels(
         );
     }
 
+    #[cfg(feature = "ring")]
     if let Some(ref dt) = config.channels_config.dingtalk {
         channels.push(ConfiguredChannel {
             display_name: "DingTalk",
@@ -3392,7 +3438,14 @@ fn collect_configured_channels(
             )),
         });
     }
+    #[cfg(not(feature = "ring"))]
+    if config.channels_config.dingtalk.is_some() {
+        tracing::warn!(
+            "DingTalk channel is configured but this build was compiled without `ring` feature; skipping DingTalk."
+        );
+    }
 
+    #[cfg(feature = "channels-websocket")]
     if let Some(ref qq) = config.channels_config.qq {
         channels.push(ConfiguredChannel {
             display_name: "QQ",
@@ -3402,6 +3455,12 @@ fn collect_configured_channels(
                 qq.allowed_users.clone(),
             )),
         });
+    }
+    #[cfg(not(feature = "channels-websocket"))]
+    if config.channels_config.qq.is_some() {
+        tracing::warn!(
+            "QQ channel is configured but this build was compiled without `channels-websocket` feature; skipping QQ."
+        );
     }
 
     if let Some(ref wc) = config.channels_config.wecom {

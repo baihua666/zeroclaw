@@ -3371,7 +3371,7 @@ pub struct ChannelsConfig {
     /// Nextcloud Talk bot channel configuration.
     pub nextcloud_talk: Option<NextcloudTalkConfig>,
     /// Email channel configuration.
-    pub email: Option<crate::channels::email_channel::EmailConfig>,
+    pub email: Option<crate::channels::EmailConfig>,
     /// IRC channel configuration.
     pub irc: Option<IrcConfig>,
     /// Lark channel configuration.
@@ -3459,6 +3459,7 @@ impl ChannelsConfig {
                 Box::new(ConfigWrapper::new(self.nextcloud_talk.as_ref())),
                 self.nextcloud_talk.is_some(),
             ),
+            #[cfg(feature = "ring")]
             (
                 Box::new(ConfigWrapper::new(self.email.as_ref())),
                 self.email.is_some(),
@@ -5346,6 +5347,7 @@ impl Config {
                     "config.channels_config.nextcloud_talk.webhook_secret",
                 )?;
             }
+            #[cfg(feature = "ring")]
             if let Some(ref mut em) = config.channels_config.email {
                 decrypt_secret(
                     &store,
@@ -6408,6 +6410,7 @@ impl Config {
                 "config.channels_config.nextcloud_talk.webhook_secret",
             )?;
         }
+        #[cfg(feature = "ring")]
         if let Some(ref mut em) = config_to_save.channels_config.email {
             encrypt_secret(
                 &store,

@@ -812,9 +812,11 @@ fn mask_sensitive_fields(config: &crate::config::Config) -> crate::config::Confi
     if let Some(telegram) = masked.channels_config.telegram.as_mut() {
         mask_required_secret(&mut telegram.bot_token);
     }
+    #[cfg(feature = "ring")]
     if let Some(discord) = masked.channels_config.discord.as_mut() {
         mask_required_secret(&mut discord.bot_token);
     }
+    #[cfg(feature = "channels-websocket")]
     if let Some(slack) = masked.channels_config.slack.as_mut() {
         mask_required_secret(&mut slack.bot_token);
         mask_optional_secret(&mut slack.app_token);
@@ -859,9 +861,11 @@ fn mask_sensitive_fields(config: &crate::config::Config) -> crate::config::Confi
         mask_optional_secret(&mut feishu.encrypt_key);
         mask_optional_secret(&mut feishu.verification_token);
     }
+    #[cfg(feature = "ring")]
     if let Some(dingtalk) = masked.channels_config.dingtalk.as_mut() {
         mask_required_secret(&mut dingtalk.client_secret);
     }
+    #[cfg(feature = "channels-websocket")]
     if let Some(qq) = masked.channels_config.qq.as_mut() {
         mask_required_secret(&mut qq.app_secret);
     }
@@ -873,6 +877,7 @@ fn mask_sensitive_fields(config: &crate::config::Config) -> crate::config::Confi
         mask_required_secret(&mut clawdtalk.api_key);
         mask_optional_secret(&mut clawdtalk.webhook_secret);
     }
+    #[cfg(feature = "ring")]
     if let Some(email) = masked.channels_config.email.as_mut() {
         mask_required_secret(&mut email.password);
     }
@@ -936,12 +941,14 @@ fn restore_masked_sensitive_fields(
     ) {
         restore_required_secret(&mut incoming_ch.bot_token, &current_ch.bot_token);
     }
+    #[cfg(feature = "ring")]
     if let (Some(incoming_ch), Some(current_ch)) = (
         incoming.channels_config.discord.as_mut(),
         current.channels_config.discord.as_ref(),
     ) {
         restore_required_secret(&mut incoming_ch.bot_token, &current_ch.bot_token);
     }
+    #[cfg(feature = "channels-websocket")]
     if let (Some(incoming_ch), Some(current_ch)) = (
         incoming.channels_config.slack.as_mut(),
         current.channels_config.slack.as_ref(),
@@ -1031,12 +1038,14 @@ fn restore_masked_sensitive_fields(
             &current_ch.verification_token,
         );
     }
+    #[cfg(feature = "ring")]
     if let (Some(incoming_ch), Some(current_ch)) = (
         incoming.channels_config.dingtalk.as_mut(),
         current.channels_config.dingtalk.as_ref(),
     ) {
         restore_required_secret(&mut incoming_ch.client_secret, &current_ch.client_secret);
     }
+    #[cfg(feature = "channels-websocket")]
     if let (Some(incoming_ch), Some(current_ch)) = (
         incoming.channels_config.qq.as_mut(),
         current.channels_config.qq.as_ref(),
@@ -1057,6 +1066,7 @@ fn restore_masked_sensitive_fields(
         restore_required_secret(&mut incoming_ch.api_key, &current_ch.api_key);
         restore_optional_secret(&mut incoming_ch.webhook_secret, &current_ch.webhook_secret);
     }
+    #[cfg(feature = "ring")]
     if let (Some(incoming_ch), Some(current_ch)) = (
         incoming.channels_config.email.as_mut(),
         current.channels_config.email.as_ref(),
@@ -1105,7 +1115,7 @@ mod tests {
             receive_mode: crate::config::schema::LarkReceiveMode::Websocket,
             port: None,
         });
-        cfg.channels_config.email = Some(crate::channels::email_channel::EmailConfig {
+        cfg.channels_config.email = Some(crate::channels::EmailConfig {
             imap_host: "imap.example.com".to_string(),
             imap_port: 993,
             imap_folder: "INBOX".to_string(),
@@ -1239,7 +1249,7 @@ mod tests {
             receive_mode: crate::config::schema::LarkReceiveMode::Websocket,
             port: None,
         });
-        current.channels_config.email = Some(crate::channels::email_channel::EmailConfig {
+        current.channels_config.email = Some(crate::channels::EmailConfig {
             imap_host: "imap.example.com".to_string(),
             imap_port: 993,
             imap_folder: "INBOX".to_string(),
@@ -1304,6 +1314,7 @@ mod tests {
             feishu.encrypt_key = Some(MASKED_SECRET.to_string());
             feishu.verification_token = Some("feishu-verify-new".to_string());
         }
+        #[cfg(feature = "ring")]
         if let Some(email) = incoming.channels_config.email.as_mut() {
             email.password = MASKED_SECRET.to_string();
         }
