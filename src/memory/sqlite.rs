@@ -17,6 +17,18 @@ use uuid::Uuid;
 /// Maximum allowed open timeout (seconds) to avoid unreasonable waits.
 const SQLITE_OPEN_TIMEOUT_CAP_SECS: u64 = 300;
 
+#[cfg(all(unix, feature = "v821"))]
+fn v821_path_accessible(path: &Path) -> bool {
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt;
+
+    let Ok(path_cstr) = CString::new(path.as_os_str().as_bytes()) else {
+        return false;
+    };
+
+    unsafe { libc::access(path_cstr.as_ptr(), libc::F_OK) == 0 }
+}
+
 /// SQLite-backed persistent memory — the brain
 ///
 /// Full-stack search engine:
@@ -62,10 +74,24 @@ impl SqliteMemory {
         let db_path = workspace_dir.join("memory").join("brain.db");
 
         if let Some(parent) = db_path.parent() {
-            std::fs::create_dir_all(parent)?;
+            #[cfg(feature = "v821")]
+            {
+                super::v821_memory_debug("sqlite:ensure_parent:start");
+                if !v821_path_accessible(parent) {
+                    std::fs::create_dir_all(parent)?;
+                }
+                super::v821_memory_debug("sqlite:ensure_parent:done");
+            }
+
+            #[cfg(not(feature = "v821"))]
+            {
+                std::fs::create_dir_all(parent)?;
+            }
         }
 
+        super::v821_memory_debug("sqlite:open_connection:start");
         let conn = Self::open_connection(&db_path, open_timeout_secs)?;
+        super::v821_memory_debug("sqlite:open_connection:done");
 
         // ── Production-grade PRAGMA tuning ──────────────────────
         // WAL mode: concurrent reads during writes, crash-safe
@@ -73,6 +99,7 @@ impl SqliteMemory {
         // mmap 8 MB: let the OS page-cache serve hot reads
         // cache 2 MB: keep ~500 hot pages in-process
         // temp_store memory: temp tables never hit disk
+        super::v821_memory_debug("sqlite:pragmas:start");
         conn.execute_batch(
             "PRAGMA journal_mode = WAL;
              PRAGMA synchronous  = NORMAL;
@@ -80,8 +107,11 @@ impl SqliteMemory {
              PRAGMA cache_size   = -2000;
              PRAGMA temp_store   = MEMORY;",
         )?;
+        super::v821_memory_debug("sqlite:pragmas:done");
 
+        super::v821_memory_debug("sqlite:init_schema:start");
         Self::init_schema(&conn)?;
+        super::v821_memory_debug("sqlite:init_schema:done");
 
         Ok(Self {
             conn: Arc::new(Mutex::new(conn)),

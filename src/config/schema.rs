@@ -6,11 +6,19 @@ use directories::UserDirs;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+#[cfg(feature = "v821")]
+use std::ffi::CString;
+use std::fs as std_fs;
+#[cfg(all(unix, feature = "v821"))]
+use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 use std::sync::{OnceLock, RwLock};
-#[cfg(unix)]
+#[cfg(all(unix, not(feature = "v821")))]
 use tokio::fs::File;
-use tokio::fs::{self, OpenOptions};
+#[cfg(not(feature = "v821"))]
+use tokio::fs::OpenOptions;
+use tokio::fs::{self};
+#[cfg(not(feature = "v821"))]
 use tokio::io::AsyncWriteExt;
 
 const SUPPORTED_PROXY_SERVICE_KEYS: &[&str] = &[
@@ -56,6 +64,493 @@ const SUPPORTED_PROXY_SERVICE_SELECTORS: &[&str] = &[
 static RUNTIME_PROXY_CONFIG: OnceLock<RwLock<ProxyConfig>> = OnceLock::new();
 static RUNTIME_PROXY_CLIENT_CACHE: OnceLock<RwLock<HashMap<String, reqwest::Client>>> =
     OnceLock::new();
+
+fn v821_config_debug(stage: &str) {
+    if cfg!(feature = "v821") && std::env::var_os("ZEROCLAW_V821_DEBUG").is_some() {
+        eprintln!("[v821-config] {stage}");
+    }
+}
+
+fn normalize_legacy_multiline_arrays(contents: &str) -> String {
+    let mut normalized = String::with_capacity(contents.len());
+    let mut lines = contents.lines().peekable();
+
+    while let Some(line) = lines.next() {
+        let trimmed = line.trim();
+        let Some((key, value)) = line.split_once('=') else {
+            normalized.push_str(line);
+            normalized.push('\n');
+            continue;
+        };
+
+        if !trimmed.ends_with('[') || value.trim() != "[" {
+            normalized.push_str(line);
+            normalized.push('\n');
+            continue;
+        }
+
+        let mut items: Vec<String> = Vec::new();
+        let mut found_closing = false;
+
+        while let Some(next_line) = lines.peek() {
+            let next_trimmed = next_line.trim();
+            lines.next();
+
+            if next_trimmed == "]" {
+                found_closing = true;
+                break;
+            }
+
+            if next_trimmed.is_empty() {
+                continue;
+            }
+
+            items.push(next_trimmed.to_string());
+        }
+
+        if found_closing {
+            normalized.push_str(key);
+            normalized.push_str("= [");
+            normalized.push_str(&items.join(" "));
+            normalized.push_str("]\n");
+        } else {
+            normalized.push_str(line);
+            normalized.push('\n');
+            for item in items {
+                normalized.push_str(&item);
+                normalized.push('\n');
+            }
+        }
+    }
+
+    normalized
+}
+
+fn should_strip_v821_array_field(path: &str) -> bool {
+    matches!(
+        path,
+        "model_routes"
+            | "embedding_routes"
+            | "autonomy.allowed_commands"
+            | "autonomy.forbidden_paths"
+            | "autonomy.shell_env_passthrough"
+            | "autonomy.auto_approve"
+            | "autonomy.always_ask"
+            | "autonomy.allowed_roots"
+            | "autonomy.non_cli_excluded_tools"
+            | "security.sandbox.firejail_args"
+            | "security.otp.gated_actions"
+            | "security.otp.gated_domains"
+            | "security.otp.gated_domain_categories"
+            | "security.nevis.role_mapping"
+            | "runtime.docker.allowed_workspace_roots"
+            | "reliability.fallback_providers"
+            | "reliability.api_keys"
+            | "agent.tool_call_dedup_exempt"
+            | "agent.tool_filter_groups"
+            | "query_classification.rules"
+            | "gateway.paired_tokens"
+            | "microsoft365.scopes"
+            | "browser.allowed_domains"
+            | "http_request.allowed_domains"
+            | "web_fetch.allowed_domains"
+            | "web_fetch.blocked_domains"
+            | "proxy.no_proxy"
+            | "proxy.services"
+            | "peripherals.boards"
+            | "hooks.builtin.webhook_audit.tool_patterns"
+            | "mcp.servers"
+            | "node_transport.allowed_peers"
+            | "nodes.allowed_peers"
+    )
+}
+
+fn strip_v821_problematic_array_fields(contents: &str) -> (String, Vec<String>) {
+    let mut sanitized = String::with_capacity(contents.len());
+    let mut stripped = Vec::new();
+    let mut current_section = String::new();
+    let mut skip_path: Option<String> = None;
+
+    for line in contents.lines() {
+        let trimmed = line.trim();
+
+        if skip_path.is_some() {
+            if trimmed == "]" {
+                skip_path = None;
+            }
+            continue;
+        }
+
+        if trimmed.starts_with('[') && trimmed.ends_with(']') {
+            current_section = trimmed
+                .trim_start_matches('[')
+                .trim_end_matches(']')
+                .to_string();
+            sanitized.push_str(line);
+            sanitized.push('\n');
+            continue;
+        }
+
+        let Some((raw_key, raw_value)) = line.split_once('=') else {
+            sanitized.push_str(line);
+            sanitized.push('\n');
+            continue;
+        };
+
+        let key = raw_key.trim();
+        let full_path = if current_section.is_empty() {
+            key.to_string()
+        } else {
+            format!("{current_section}.{key}")
+        };
+
+        if should_strip_v821_array_field(&full_path) {
+            let value = raw_value.trim();
+            if value.starts_with('[') {
+                stripped.push(full_path.clone());
+                if !value.ends_with(']') {
+                    skip_path = Some(full_path);
+                }
+                continue;
+            }
+        }
+
+        sanitized.push_str(line);
+        sanitized.push('\n');
+    }
+
+    (sanitized, stripped)
+}
+
+fn deserialize_config_with_ignored(contents: &str) -> Result<(Config, Vec<String>)> {
+    let mut ignored_paths: Vec<String> = Vec::new();
+    let config: Config = serde_ignored::deserialize(
+        toml::de::Deserializer::parse(contents).context("Failed to parse config file")?,
+        |path| {
+            ignored_paths.push(path.to_string());
+        },
+    )
+    .context("Failed to deserialize config file")?;
+    Ok((config, ignored_paths))
+}
+
+fn error_has_v821_recursion_depth(err: &anyhow::Error) -> bool {
+    err.chain().any(|cause| {
+        cause
+            .to_string()
+            .contains("cannot recurse further; max recursion depth met")
+    })
+}
+
+async fn startup_create_dir_all(path: &Path) -> std::io::Result<()> {
+    #[cfg(feature = "v821")]
+    {
+        v821_mkdir_all(path)
+    }
+
+    #[cfg(not(feature = "v821"))]
+    {
+        fs::create_dir_all(path).await
+    }
+}
+
+async fn startup_read_to_string(path: &Path) -> std::io::Result<String> {
+    #[cfg(feature = "v821")]
+    {
+        v821_read_to_string(path)
+    }
+
+    #[cfg(not(feature = "v821"))]
+    {
+        fs::read_to_string(path).await
+    }
+}
+
+#[cfg(all(unix, feature = "v821"))]
+fn v821_read_to_string(path: &Path) -> std::io::Result<String> {
+    let c_path = path_to_cstring(path)?;
+    let fd = unsafe { libc::open(c_path.as_ptr(), libc::O_RDONLY) };
+    if fd < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+
+    let mut bytes = Vec::new();
+    let mut buffer = [0u8; 8192];
+
+    loop {
+        let rc = unsafe { libc::read(fd, buffer.as_mut_ptr().cast(), buffer.len()) };
+        if rc < 0 {
+            let err = std::io::Error::last_os_error();
+            unsafe {
+                libc::close(fd);
+            }
+            return Err(err);
+        }
+        if rc == 0 {
+            break;
+        }
+        bytes.extend_from_slice(&buffer[..rc as usize]);
+    }
+
+    if unsafe { libc::close(fd) } < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+
+    String::from_utf8(bytes)
+        .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error.utf8_error()))
+}
+
+fn startup_path_exists(path: &Path) -> bool {
+    #[cfg(feature = "v821")]
+    {
+        path_to_cstring(path)
+            .ok()
+            .is_some_and(|c_path| unsafe { libc::access(c_path.as_ptr(), libc::F_OK) == 0 })
+    }
+
+    #[cfg(not(feature = "v821"))]
+    {
+        path.exists()
+    }
+}
+
+#[cfg(all(unix, feature = "v821"))]
+fn path_to_cstring(path: &Path) -> std::io::Result<CString> {
+    CString::new(path.as_os_str().as_bytes()).map_err(|_| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("Path contains interior NUL byte: {}", path.display()),
+        )
+    })
+}
+
+#[cfg(all(unix, feature = "v821"))]
+fn v821_mkdir_all(path: &Path) -> std::io::Result<()> {
+    let mut current = PathBuf::new();
+    for component in path.components() {
+        current.push(component.as_os_str());
+        if current.as_os_str().is_empty() || current == Path::new("/") {
+            continue;
+        }
+
+        let c_path = path_to_cstring(&current)?;
+        let rc = unsafe { libc::mkdir(c_path.as_ptr(), 0o755) };
+        if rc == 0 {
+            continue;
+        }
+
+        let err = std::io::Error::last_os_error();
+        if err.kind() == std::io::ErrorKind::AlreadyExists {
+            continue;
+        }
+        return Err(err);
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+async fn startup_metadata(path: &Path) -> std::io::Result<std_fs::Metadata> {
+    #[cfg(feature = "v821")]
+    {
+        std_fs::metadata(path)
+    }
+
+    #[cfg(not(feature = "v821"))]
+    {
+        fs::metadata(path).await
+    }
+}
+
+#[cfg(unix)]
+async fn startup_set_permissions(
+    path: &Path,
+    permissions: std_fs::Permissions,
+) -> std::io::Result<()> {
+    #[cfg(feature = "v821")]
+    {
+        std_fs::set_permissions(path, permissions)
+    }
+
+    #[cfg(not(feature = "v821"))]
+    {
+        fs::set_permissions(path, permissions).await
+    }
+}
+
+async fn startup_copy(from: &Path, to: &Path) -> std::io::Result<u64> {
+    #[cfg(feature = "v821")]
+    {
+        std_fs::copy(from, to)
+    }
+
+    #[cfg(not(feature = "v821"))]
+    {
+        fs::copy(from, to).await
+    }
+}
+
+async fn startup_rename(from: &Path, to: &Path) -> std::io::Result<()> {
+    #[cfg(feature = "v821")]
+    {
+        std_fs::rename(from, to)
+    }
+
+    #[cfg(not(feature = "v821"))]
+    {
+        fs::rename(from, to).await
+    }
+}
+
+async fn startup_remove_file(path: &Path) -> std::io::Result<()> {
+    #[cfg(feature = "v821")]
+    {
+        std_fs::remove_file(path)
+    }
+
+    #[cfg(not(feature = "v821"))]
+    {
+        fs::remove_file(path).await
+    }
+}
+
+async fn write_config_atomically(config_path: &Path, toml_str: &str) -> Result<()> {
+    let parent_dir = config_path
+        .parent()
+        .context("Config path must have a parent directory")?;
+
+    startup_create_dir_all(parent_dir).await.with_context(|| {
+        format!(
+            "Failed to create config directory: {}",
+            parent_dir.display()
+        )
+    })?;
+
+    #[cfg(feature = "v821")]
+    {
+        v821_write_file(config_path, toml_str.as_bytes())
+            .with_context(|| format!("Failed to write config file: {}", config_path.display()))?;
+        return Ok(());
+    }
+
+    #[cfg(not(feature = "v821"))]
+    {
+        let file_name = config_path
+            .file_name()
+            .and_then(|v| v.to_str())
+            .unwrap_or("config.toml");
+        let temp_path = parent_dir.join(format!(".{file_name}.tmp-{}", uuid::Uuid::new_v4()));
+        let backup_path = parent_dir.join(format!("{file_name}.bak"));
+
+        let mut temp_file = OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .open(&temp_path)
+            .await
+            .with_context(|| {
+                format!(
+                    "Failed to create temporary config file: {}",
+                    temp_path.display()
+                )
+            })?;
+        temp_file
+            .write_all(toml_str.as_bytes())
+            .await
+            .context("Failed to write temporary config contents")?;
+        temp_file
+            .sync_all()
+            .await
+            .context("Failed to fsync temporary config file")?;
+        drop(temp_file);
+
+        let had_existing_config = startup_path_exists(config_path);
+        if had_existing_config {
+            startup_copy(config_path, &backup_path)
+                .await
+                .with_context(|| {
+                    format!(
+                        "Failed to create config backup before atomic replace: {}",
+                        backup_path.display()
+                    )
+                })?;
+        }
+
+        if let Err(error) = startup_rename(&temp_path, config_path).await {
+            let _ = startup_remove_file(&temp_path).await;
+            if had_existing_config && startup_path_exists(&backup_path) {
+                startup_copy(&backup_path, config_path)
+                    .await
+                    .context("Failed to restore config backup")?;
+            }
+            anyhow::bail!("Failed to atomically replace config file: {error}");
+        }
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            if let Err(err) =
+                startup_set_permissions(config_path, std_fs::Permissions::from_mode(0o600)).await
+            {
+                tracing::warn!(
+                    "Failed to harden config permissions to 0600 at {}: {}",
+                    config_path.display(),
+                    err
+                );
+            }
+        }
+
+        sync_directory(parent_dir).await?;
+
+        if had_existing_config {
+            let _ = startup_remove_file(&backup_path).await;
+        }
+
+        Ok(())
+    }
+}
+
+#[cfg(all(unix, feature = "v821"))]
+fn v821_write_file(path: &Path, contents: &[u8]) -> std::io::Result<()> {
+    let c_path = path_to_cstring(path)?;
+    let fd = unsafe {
+        libc::open(
+            c_path.as_ptr(),
+            libc::O_CREAT | libc::O_TRUNC | libc::O_WRONLY,
+            0o600,
+        )
+    };
+    if fd < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+
+    let mut written = 0usize;
+    while written < contents.len() {
+        let rc = unsafe {
+            libc::write(
+                fd,
+                contents[written..].as_ptr().cast(),
+                contents.len() - written,
+            )
+        };
+        if rc < 0 {
+            let err = std::io::Error::last_os_error();
+            unsafe {
+                libc::close(fd);
+            }
+            return Err(err);
+        }
+        written += rc as usize;
+    }
+
+    let sync_rc = unsafe { libc::fsync(fd) };
+    let close_rc = unsafe { libc::close(fd) };
+    if sync_rc < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    if close_rc < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
+}
 
 // ── Top-level config ──────────────────────────────────────────────
 
@@ -145,11 +640,11 @@ pub struct Config {
     pub skills: SkillsConfig,
 
     /// Model routing rules — route `hint:<name>` to specific provider+model combos.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub model_routes: Vec<ModelRouteConfig>,
 
     /// Embedding routing rules — route `hint:<name>` to specific provider+model combos.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub embedding_routes: Vec<EmbeddingRouteConfig>,
 
     /// Automatic query classification — maps user messages to model hints.
@@ -2244,11 +2739,34 @@ pub fn runtime_proxy_config() -> ProxyConfig {
     }
 }
 
+fn insecure_tls_enabled() -> bool {
+    std::env::var("ZEROCLAW_INSECURE_TLS")
+        .ok()
+        .map(|value| {
+            matches!(
+                value.trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes" | "on"
+            )
+        })
+        .unwrap_or(false)
+}
+
 pub fn apply_runtime_proxy_to_builder(
     builder: reqwest::ClientBuilder,
     service_key: &str,
 ) -> reqwest::ClientBuilder {
     runtime_proxy_config().apply_to_reqwest_builder(builder, service_key)
+}
+
+pub fn apply_runtime_network_overrides_to_builder(
+    builder: reqwest::ClientBuilder,
+    service_key: &str,
+) -> reqwest::ClientBuilder {
+    let mut builder = apply_runtime_proxy_to_builder(builder, service_key);
+    if insecure_tls_enabled() {
+        builder = builder.danger_accept_invalid_certs(true);
+    }
+    builder
 }
 
 pub fn build_runtime_proxy_client(service_key: &str) -> reqwest::Client {
@@ -2257,7 +2775,8 @@ pub fn build_runtime_proxy_client(service_key: &str) -> reqwest::Client {
         return client;
     }
 
-    let builder = apply_runtime_proxy_to_builder(reqwest::Client::builder(), service_key);
+    let builder =
+        apply_runtime_network_overrides_to_builder(reqwest::Client::builder(), service_key);
     let client = builder.build().unwrap_or_else(|error| {
         tracing::warn!(service_key, "Failed to build proxied client: {error}");
         reqwest::Client::new()
@@ -2280,7 +2799,7 @@ pub fn build_runtime_proxy_client_with_timeouts(
     let builder = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(timeout_secs))
         .connect_timeout(std::time::Duration::from_secs(connect_timeout_secs));
-    let builder = apply_runtime_proxy_to_builder(builder, service_key);
+    let builder = apply_runtime_network_overrides_to_builder(builder, service_key);
     let client = builder.build().unwrap_or_else(|error| {
         tracing::warn!(
             service_key,
@@ -2419,8 +2938,10 @@ pub struct MemoryConfig {
     ///
     /// `postgres` requires `[storage.provider.config]` with `db_url` (`dbURL` alias supported).
     /// `qdrant` uses `[memory.qdrant]` config or `QDRANT_URL` env var.
+    #[serde(default = "default_memory_backend")]
     pub backend: String,
     /// Auto-save user-stated conversation input to memory (assistant output is excluded)
+    #[serde(default = "default_true")]
     pub auto_save: bool,
     /// Run memory/session hygiene (archiving + retention cleanup)
     #[serde(default = "default_hygiene_enabled")]
@@ -2494,6 +3015,10 @@ pub struct MemoryConfig {
     /// Only used when `backend = "qdrant"`.
     #[serde(default)]
     pub qdrant: QdrantConfig,
+}
+
+fn default_memory_backend() -> String {
+    "sqlite".into()
 }
 
 fn default_embedding_provider() -> String {
@@ -2711,17 +3236,23 @@ impl Default for WebhookAuditConfig {
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct AutonomyConfig {
     /// Autonomy level: `read_only`, `supervised` (default), or `full`.
+    #[serde(default = "default_autonomy_level")]
     pub level: AutonomyLevel,
     /// Restrict absolute filesystem paths to workspace-relative references. Default: `true`.
     /// Resolved paths outside the workspace still require `allowed_roots`.
+    #[serde(default = "default_true")]
     pub workspace_only: bool,
     /// Allowlist of executable names permitted for shell execution.
+    #[serde(default = "default_allowed_commands")]
     pub allowed_commands: Vec<String>,
     /// Explicit path denylist. Default includes system-critical paths and sensitive dotdirs.
+    #[serde(default = "default_forbidden_paths")]
     pub forbidden_paths: Vec<String>,
     /// Maximum actions allowed per hour per policy. Default: `100`.
+    #[serde(default = "default_autonomy_max_actions_per_hour")]
     pub max_actions_per_hour: u32,
     /// Maximum cost per day in cents per policy. Default: `1000`.
+    #[serde(default = "default_autonomy_max_cost_per_day_cents")]
     pub max_cost_per_day_cents: u32,
 
     /// Require explicit approval for medium-risk shell commands.
@@ -2769,6 +3300,59 @@ fn default_always_ask() -> Vec<String> {
     vec![]
 }
 
+fn default_autonomy_level() -> AutonomyLevel {
+    AutonomyLevel::Supervised
+}
+
+fn default_allowed_commands() -> Vec<String> {
+    vec![
+        "git".into(),
+        "npm".into(),
+        "cargo".into(),
+        "ls".into(),
+        "cat".into(),
+        "grep".into(),
+        "find".into(),
+        "echo".into(),
+        "pwd".into(),
+        "wc".into(),
+        "head".into(),
+        "tail".into(),
+        "date".into(),
+    ]
+}
+
+fn default_forbidden_paths() -> Vec<String> {
+    vec![
+        "/etc".into(),
+        "/root".into(),
+        "/home".into(),
+        "/usr".into(),
+        "/bin".into(),
+        "/sbin".into(),
+        "/lib".into(),
+        "/opt".into(),
+        "/boot".into(),
+        "/dev".into(),
+        "/proc".into(),
+        "/sys".into(),
+        "/var".into(),
+        "/tmp".into(),
+        "~/.ssh".into(),
+        "~/.gnupg".into(),
+        "~/.aws".into(),
+        "~/.config".into(),
+    ]
+}
+
+fn default_autonomy_max_actions_per_hour() -> u32 {
+    20
+}
+
+fn default_autonomy_max_cost_per_day_cents() -> u32 {
+    500
+}
+
 fn is_valid_env_var_name(name: &str) -> bool {
     let mut chars = name.chars();
     match chars.next() {
@@ -2781,45 +3365,12 @@ fn is_valid_env_var_name(name: &str) -> bool {
 impl Default for AutonomyConfig {
     fn default() -> Self {
         Self {
-            level: AutonomyLevel::Supervised,
+            level: default_autonomy_level(),
             workspace_only: true,
-            allowed_commands: vec![
-                "git".into(),
-                "npm".into(),
-                "cargo".into(),
-                "ls".into(),
-                "cat".into(),
-                "grep".into(),
-                "find".into(),
-                "echo".into(),
-                "pwd".into(),
-                "wc".into(),
-                "head".into(),
-                "tail".into(),
-                "date".into(),
-            ],
-            forbidden_paths: vec![
-                "/etc".into(),
-                "/root".into(),
-                "/home".into(),
-                "/usr".into(),
-                "/bin".into(),
-                "/sbin".into(),
-                "/lib".into(),
-                "/opt".into(),
-                "/boot".into(),
-                "/dev".into(),
-                "/proc".into(),
-                "/sys".into(),
-                "/var".into(),
-                "/tmp".into(),
-                "~/.ssh".into(),
-                "~/.gnupg".into(),
-                "~/.aws".into(),
-                "~/.config".into(),
-            ],
-            max_actions_per_hour: 20,
-            max_cost_per_day_cents: 500,
+            allowed_commands: default_allowed_commands(),
+            forbidden_paths: default_forbidden_paths(),
+            max_actions_per_hour: default_autonomy_max_actions_per_hour(),
+            max_cost_per_day_cents: default_autonomy_max_cost_per_day_cents(),
             require_approval_for_medium_risk: true,
             block_high_risk_commands: true,
             shell_env_passthrough: vec![],
@@ -4731,10 +5282,20 @@ struct ActiveWorkspaceState {
 }
 
 fn default_config_dir() -> Result<PathBuf> {
+    let home = effective_home_dir_for_config()?;
+    Ok(home.join(".zeroclaw"))
+}
+
+fn effective_home_dir_for_config() -> Result<PathBuf> {
     let home = UserDirs::new()
         .map(|u| u.home_dir().to_path_buf())
         .context("Could not find home directory")?;
-    Ok(home.join(".zeroclaw"))
+
+    if cfg!(feature = "v821") && home == Path::new("/") {
+        return Ok(std::env::temp_dir());
+    }
+
+    Ok(home)
 }
 
 fn active_workspace_state_path(default_dir: &Path) -> PathBuf {
@@ -4754,7 +5315,7 @@ async fn load_persisted_workspace_dirs(
     default_config_dir: &Path,
 ) -> Result<Option<(PathBuf, PathBuf)>> {
     let state_path = active_workspace_state_path(default_config_dir);
-    if !state_path.exists() {
+    if !startup_path_exists(&state_path) {
         return Ok(None);
     }
 
@@ -4816,7 +5377,7 @@ pub(crate) async fn persist_active_workspace_config_dir(config_dir: &Path) -> Re
     }
 
     if config_dir == default_config_dir {
-        if state_path.exists() {
+        if startup_path_exists(&state_path) {
             fs::remove_file(&state_path).await.with_context(|| {
                 format!(
                     "Failed to clear active workspace marker: {}",
@@ -4867,7 +5428,7 @@ pub(crate) async fn persist_active_workspace_config_dir(config_dir: &Path) -> Re
 
 pub(crate) fn resolve_config_dir_for_workspace(workspace_dir: &Path) -> (PathBuf, PathBuf) {
     let workspace_config_dir = workspace_dir.to_path_buf();
-    if workspace_config_dir.join("config.toml").exists() {
+    if startup_path_exists(&workspace_config_dir.join("config.toml")) {
         return (
             workspace_config_dir.clone(),
             workspace_config_dir.join("workspace"),
@@ -4878,7 +5439,7 @@ pub(crate) fn resolve_config_dir_for_workspace(workspace_dir: &Path) -> (PathBuf
         .parent()
         .map(|parent| parent.join(".zeroclaw"));
     if let Some(legacy_dir) = legacy_config_dir {
-        if legacy_dir.join("config.toml").exists() {
+        if startup_path_exists(&legacy_dir.join("config.toml")) {
             return (legacy_dir, workspace_config_dir);
         }
 
@@ -5125,27 +5686,42 @@ fn read_codex_openai_api_key() -> Option<String> {
 
 impl Config {
     pub async fn load_or_init() -> Result<Self> {
+        v821_config_debug("dirs:default:start");
         let (default_zeroclaw_dir, default_workspace_dir) = default_config_and_workspace_dirs()?;
+        v821_config_debug("dirs:default:done");
 
+        v821_config_debug("dirs:resolve:start");
         let (zeroclaw_dir, workspace_dir, resolution_source) =
             resolve_runtime_config_dirs(&default_zeroclaw_dir, &default_workspace_dir).await?;
+        v821_config_debug("dirs:resolve:done");
 
         let config_path = zeroclaw_dir.join("config.toml");
 
-        fs::create_dir_all(&zeroclaw_dir)
+        v821_config_debug("mkdir:config:start");
+        startup_create_dir_all(&zeroclaw_dir)
             .await
             .with_context(|| config_dir_creation_error(&zeroclaw_dir))?;
-        fs::create_dir_all(&workspace_dir)
+        v821_config_debug("mkdir:config:done");
+        v821_config_debug("mkdir:workspace:start");
+        startup_create_dir_all(&workspace_dir)
             .await
             .context("Failed to create workspace directory")?;
+        v821_config_debug("mkdir:workspace:done");
 
-        if config_path.exists() {
+        v821_config_debug("config:exists:check");
+        let config_exists = startup_path_exists(&config_path);
+        v821_config_debug("config:exists:done");
+        if config_exists {
+            v821_config_debug("config:read:start");
             // Warn if config file is world-readable (may contain API keys)
-            #[cfg(unix)]
+            #[cfg(all(unix, not(feature = "v821")))]
             {
+                v821_config_debug("config:metadata:start");
                 use std::os::unix::fs::PermissionsExt;
-                if let Ok(meta) = fs::metadata(&config_path).await {
+                if let Ok(meta) = startup_metadata(&config_path).await {
+                    v821_config_debug("config:metadata:done");
                     if meta.permissions().mode() & 0o004 != 0 {
+                        v821_config_debug("config:warn_world_readable:start");
                         tracing::warn!(
                             "Config file {:?} is world-readable (mode {:o}). \
                              Consider restricting with: chmod 600 {:?}",
@@ -5153,24 +5729,43 @@ impl Config {
                             meta.permissions().mode() & 0o777,
                             config_path,
                         );
+                        v821_config_debug("config:warn_world_readable:done");
                     }
                 }
             }
+            #[cfg(all(unix, feature = "v821"))]
+            {
+                // V821 runtime has already proven unstable in std metadata probing during startup.
+                // Skip this non-critical permission warning and continue boot.
+                v821_config_debug("config:metadata:skipped:v821");
+            }
 
-            let contents = fs::read_to_string(&config_path)
+            let raw_contents = startup_read_to_string(&config_path)
                 .await
                 .context("Failed to read config file")?;
+            v821_config_debug("config:read:done");
+            let contents = normalize_legacy_multiline_arrays(&raw_contents);
 
-            // Track ignored/unknown config keys to warn users about silent misconfigurations
-            // (e.g., using [providers.ollama] which doesn't exist instead of top-level api_url)
-            let mut ignored_paths: Vec<String> = Vec::new();
-            let mut config: Config = serde_ignored::deserialize(
-                toml::de::Deserializer::parse(&contents).context("Failed to parse config file")?,
-                |path| {
-                    ignored_paths.push(path.to_string());
-                },
-            )
-            .context("Failed to deserialize config file")?;
+            v821_config_debug("config:deserialize:start");
+            let (mut config, ignored_paths) = match deserialize_config_with_ignored(&contents) {
+                Ok(result) => result,
+                Err(error) if cfg!(feature = "v821") && error_has_v821_recursion_depth(&error) => {
+                    v821_config_debug("config:deserialize:v821_retry:start");
+                    let (sanitized, stripped_paths) =
+                        strip_v821_problematic_array_fields(&contents);
+                    for path in &stripped_paths {
+                        tracing::warn!(
+                            "V821 config compatibility: stripped array field \"{}\" before retrying parse",
+                            path
+                        );
+                    }
+                    let result = deserialize_config_with_ignored(&sanitized)?;
+                    v821_config_debug("config:deserialize:v821_retry:done");
+                    result
+                }
+                Err(error) => return Err(error),
+            };
+            v821_config_debug("config:deserialize:done");
 
             // Warn about each unknown config key
             for path in ignored_paths {
@@ -5475,10 +6070,13 @@ impl Config {
             );
             Ok(config)
         } else {
+            v821_config_debug("config:default:init");
             let mut config = Config::default();
             config.config_path = config_path.clone();
             config.workspace_dir = workspace_dir;
+            v821_config_debug("config:default:save:start");
             config.save().await?;
+            v821_config_debug("config:default:save:done");
 
             // Restrict permissions on newly created config file (may contain API keys)
             #[cfg(unix)]
@@ -6534,87 +7132,7 @@ impl Config {
         let toml_str =
             toml::to_string_pretty(&config_to_save).context("Failed to serialize config")?;
 
-        let parent_dir = config_path
-            .parent()
-            .context("Config path must have a parent directory")?;
-
-        fs::create_dir_all(parent_dir).await.with_context(|| {
-            format!(
-                "Failed to create config directory: {}",
-                parent_dir.display()
-            )
-        })?;
-
-        let file_name = config_path
-            .file_name()
-            .and_then(|v| v.to_str())
-            .unwrap_or("config.toml");
-        let temp_path = parent_dir.join(format!(".{file_name}.tmp-{}", uuid::Uuid::new_v4()));
-        let backup_path = parent_dir.join(format!("{file_name}.bak"));
-
-        let mut temp_file = OpenOptions::new()
-            .create_new(true)
-            .write(true)
-            .open(&temp_path)
-            .await
-            .with_context(|| {
-                format!(
-                    "Failed to create temporary config file: {}",
-                    temp_path.display()
-                )
-            })?;
-        temp_file
-            .write_all(toml_str.as_bytes())
-            .await
-            .context("Failed to write temporary config contents")?;
-        temp_file
-            .sync_all()
-            .await
-            .context("Failed to fsync temporary config file")?;
-        drop(temp_file);
-
-        let had_existing_config = config_path.exists();
-        if had_existing_config {
-            fs::copy(&config_path, &backup_path)
-                .await
-                .with_context(|| {
-                    format!(
-                        "Failed to create config backup before atomic replace: {}",
-                        backup_path.display()
-                    )
-                })?;
-        }
-
-        if let Err(e) = fs::rename(&temp_path, &config_path).await {
-            let _ = fs::remove_file(&temp_path).await;
-            if had_existing_config && backup_path.exists() {
-                fs::copy(&backup_path, &config_path)
-                    .await
-                    .context("Failed to restore config backup")?;
-            }
-            anyhow::bail!("Failed to atomically replace config file: {e}");
-        }
-
-        #[cfg(unix)]
-        {
-            use std::{fs::Permissions, os::unix::fs::PermissionsExt};
-            if let Err(err) = fs::set_permissions(&config_path, Permissions::from_mode(0o600)).await
-            {
-                tracing::warn!(
-                    "Failed to harden config permissions to 0600 at {}: {}",
-                    config_path.display(),
-                    err
-                );
-            }
-        }
-
-        sync_directory(parent_dir).await?;
-
-        if had_existing_config {
-            let _ = fs::remove_file(&backup_path).await;
-        }
-
-        Ok(())
+        write_config_atomically(&config_path, &toml_str).await
     }
 }
 
@@ -6622,13 +7140,27 @@ impl Config {
 async fn sync_directory(path: &Path) -> Result<()> {
     #[cfg(unix)]
     {
-        let dir = File::open(path)
-            .await
-            .with_context(|| format!("Failed to open directory for fsync: {}", path.display()))?;
-        dir.sync_all()
-            .await
-            .with_context(|| format!("Failed to fsync directory metadata: {}", path.display()))?;
-        Ok(())
+        #[cfg(feature = "v821")]
+        {
+            let dir = std_fs::File::open(path).with_context(|| {
+                format!("Failed to open directory for fsync: {}", path.display())
+            })?;
+            dir.sync_all().with_context(|| {
+                format!("Failed to fsync directory metadata: {}", path.display())
+            })?;
+            return Ok(());
+        }
+
+        #[cfg(not(feature = "v821"))]
+        {
+            let dir = File::open(path).await.with_context(|| {
+                format!("Failed to open directory for fsync: {}", path.display())
+            })?;
+            dir.sync_all().await.with_context(|| {
+                format!("Failed to fsync directory metadata: {}", path.display())
+            })?;
+            Ok(())
+        }
     }
 
     #[cfg(not(unix))]
@@ -8762,6 +9294,27 @@ requires_openai_auth = true
     }
 
     #[test]
+    async fn effective_home_dir_for_config_handles_root_home_on_v821() {
+        let _env_guard = env_override_lock().await;
+        let original_home = std::env::var("HOME").ok();
+        std::env::set_var("HOME", "/");
+
+        let resolved = effective_home_dir_for_config().unwrap();
+
+        if cfg!(feature = "v821") {
+            assert_eq!(resolved, std::env::temp_dir());
+        } else {
+            assert_eq!(resolved, PathBuf::from("/"));
+        }
+
+        if let Some(home) = original_home {
+            std::env::set_var("HOME", home);
+        } else {
+            std::env::remove_var("HOME");
+        }
+    }
+
+    #[test]
     async fn load_or_init_workspace_override_uses_workspace_root_for_config() {
         let _env_guard = env_override_lock().await;
         let temp_home =
@@ -9643,6 +10196,115 @@ default_model = "legacy-model"
         let parsed: Config = toml::from_str(toml_str).unwrap();
         assert!(!parsed.transcription.enabled);
         assert_eq!(parsed.transcription.max_duration_secs, 120);
+    }
+
+    #[test]
+    async fn normalize_legacy_multiline_arrays_collapses_string_lists() {
+        let raw = r#"
+[autonomy]
+allowed_commands = [
+    "git",
+    "cargo",
+]
+forbidden_paths = [
+    "/etc",
+    "/root",
+]
+"#;
+
+        let normalized = normalize_legacy_multiline_arrays(raw);
+
+        assert!(normalized.contains("allowed_commands = [\"git\", \"cargo\",]"));
+        assert!(normalized.contains("forbidden_paths = [\"/etc\", \"/root\",]"));
+    }
+
+    #[test]
+    async fn config_parses_after_normalizing_legacy_multiline_arrays() {
+        let raw = r#"
+default_temperature = 0.7
+model_routes = []
+embedding_routes = []
+
+[autonomy]
+level = "supervised"
+workspace_only = true
+allowed_commands = [
+    "git",
+]
+forbidden_paths = [
+    "/etc",
+    "/root",
+]
+max_actions_per_hour = 20
+max_cost_per_day_cents = 500
+"#;
+
+        let normalized = normalize_legacy_multiline_arrays(raw);
+        let parsed: Config = toml::from_str(&normalized).unwrap();
+
+        assert!(parsed.model_routes.is_empty());
+        assert!(parsed.embedding_routes.is_empty());
+        assert_eq!(parsed.autonomy.allowed_commands, vec!["git"]);
+        assert_eq!(
+            parsed.autonomy.forbidden_paths,
+            vec!["/etc".to_string(), "/root".to_string()]
+        );
+    }
+
+    #[test]
+    async fn strip_v821_problematic_array_fields_removes_known_paths() {
+        let raw = r#"
+model_routes = []
+
+[autonomy]
+allowed_commands = ["git", "cargo"]
+forbidden_paths = ["a", "b"]
+
+[query_classification]
+rules = []
+"#;
+
+        let (sanitized, stripped) = strip_v821_problematic_array_fields(raw);
+
+        assert!(!sanitized.contains("model_routes = []"));
+        assert!(!sanitized.contains("allowed_commands ="));
+        assert!(!sanitized.contains("forbidden_paths ="));
+        assert!(!sanitized.contains("rules = []"));
+        assert!(stripped.contains(&"model_routes".to_string()));
+        assert!(stripped.contains(&"autonomy.allowed_commands".to_string()));
+        assert!(stripped.contains(&"autonomy.forbidden_paths".to_string()));
+        assert!(stripped.contains(&"query_classification.rules".to_string()));
+    }
+
+    #[test]
+    async fn config_parses_after_stripping_v821_problematic_arrays() {
+        let raw = r#"
+default_temperature = 0.7
+model_routes = []
+embedding_routes = []
+
+[autonomy]
+level = "supervised"
+workspace_only = true
+allowed_commands = ["git", "cargo"]
+forbidden_paths = ["a", "b"]
+max_actions_per_hour = 20
+max_cost_per_day_cents = 500
+"#;
+
+        let (sanitized, _) = strip_v821_problematic_array_fields(raw);
+        let parsed: Config = toml::from_str(&sanitized).unwrap();
+
+        assert!(parsed.model_routes.is_empty());
+        assert!(parsed.embedding_routes.is_empty());
+        assert_eq!(
+            parsed.autonomy.allowed_commands,
+            AutonomyConfig::default().allowed_commands
+        );
+        assert_eq!(
+            parsed.autonomy.forbidden_paths,
+            AutonomyConfig::default().forbidden_paths
+        );
     }
 
     #[test]

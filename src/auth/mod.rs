@@ -28,7 +28,7 @@ static REFRESH_BACKOFFS: OnceLock<Mutex<HashMap<String, Instant>>> = OnceLock::n
 #[derive(Clone)]
 pub struct AuthService {
     store: AuthProfilesStore,
-    client: reqwest::Client,
+    client: Arc<OnceLock<reqwest::Client>>,
 }
 
 impl AuthService {
@@ -40,8 +40,12 @@ impl AuthService {
     pub fn new(state_dir: &Path, encrypt_secrets: bool) -> Self {
         Self {
             store: AuthProfilesStore::new(state_dir, encrypt_secrets),
-            client: reqwest::Client::new(),
+            client: Arc::new(OnceLock::new()),
         }
+    }
+
+    fn http_client(&self) -> &reqwest::Client {
+        self.client.get_or_init(reqwest::Client::new)
     }
 
     pub async fn load_profiles(&self) -> Result<AuthProfilesData> {
@@ -210,20 +214,24 @@ impl AuthService {
             );
         }
 
-        let mut refreshed =
-            match refresh_openai_access_token_with_retries(&self.client, &refresh_token).await {
-                Ok(tokens) => {
-                    clear_refresh_backoff(&profile_id);
-                    tokens
-                }
-                Err(err) => {
-                    set_refresh_backoff(
-                        &profile_id,
-                        Duration::from_secs(OPENAI_REFRESH_FAILURE_BACKOFF_SECS),
-                    );
-                    return Err(err);
-                }
-            };
+        let mut refreshed = match refresh_openai_access_token_with_retries(
+            self.http_client(),
+            &refresh_token,
+        )
+        .await
+        {
+            Ok(tokens) => {
+                clear_refresh_backoff(&profile_id);
+                tokens
+            }
+            Err(err) => {
+                set_refresh_backoff(
+                    &profile_id,
+                    Duration::from_secs(OPENAI_REFRESH_FAILURE_BACKOFF_SECS),
+                );
+                return Err(err);
+            }
+        };
         if refreshed.refresh_token.is_none() {
             refreshed
                 .refresh_token
@@ -299,20 +307,24 @@ impl AuthService {
             );
         }
 
-        let mut refreshed =
-            match refresh_gemini_access_token_with_retries(&self.client, &refresh_token).await {
-                Ok(tokens) => {
-                    clear_refresh_backoff(&profile_id);
-                    tokens
-                }
-                Err(err) => {
-                    set_refresh_backoff(
-                        &profile_id,
-                        Duration::from_secs(OPENAI_REFRESH_FAILURE_BACKOFF_SECS),
-                    );
-                    return Err(err);
-                }
-            };
+        let mut refreshed = match refresh_gemini_access_token_with_retries(
+            self.http_client(),
+            &refresh_token,
+        )
+        .await
+        {
+            Ok(tokens) => {
+                clear_refresh_backoff(&profile_id);
+                tokens
+            }
+            Err(err) => {
+                set_refresh_backoff(
+                    &profile_id,
+                    Duration::from_secs(OPENAI_REFRESH_FAILURE_BACKOFF_SECS),
+                );
+                return Err(err);
+            }
+        };
         if refreshed.refresh_token.is_none() {
             refreshed
                 .refresh_token

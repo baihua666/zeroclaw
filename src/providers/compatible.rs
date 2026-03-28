@@ -266,8 +266,10 @@ impl OpenAiCompatibleProvider {
                 .timeout(std::time::Duration::from_secs(timeout))
                 .connect_timeout(std::time::Duration::from_secs(10))
                 .default_headers(headers);
-            let builder =
-                crate::config::apply_runtime_proxy_to_builder(builder, "provider.compatible");
+            let builder = crate::config::apply_runtime_network_overrides_to_builder(
+                builder,
+                "provider.compatible",
+            );
 
             return builder.build().unwrap_or_else(|error| {
                 tracing::warn!(
@@ -324,6 +326,16 @@ impl OpenAiCompatibleProvider {
 
         let path = url.path().trim_end_matches('/');
         !path.is_empty() && path != "/"
+    }
+
+    fn forces_prompt_guided_tools_fallback(&self) -> bool {
+        let Ok(url) = reqwest::Url::parse(&self.base_url) else {
+            return false;
+        };
+
+        url.host_str()
+            .map(|host| host.eq_ignore_ascii_case("coding.dashscope.aliyuncs.com"))
+            .unwrap_or(false)
     }
 
     /// Build the full URL for responses API, detecting if base_url already includes the path.
@@ -1168,7 +1180,9 @@ impl OpenAiCompatibleProvider {
     fn is_native_tool_schema_unsupported(status: reqwest::StatusCode, error: &str) -> bool {
         if !matches!(
             status,
-            reqwest::StatusCode::BAD_REQUEST | reqwest::StatusCode::UNPROCESSABLE_ENTITY
+            reqwest::StatusCode::BAD_REQUEST
+                | reqwest::StatusCode::UNPROCESSABLE_ENTITY
+                | reqwest::StatusCode::METHOD_NOT_ALLOWED
         ) {
             return false;
         }
@@ -1181,6 +1195,7 @@ impl OpenAiCompatibleProvider {
             "does not support tools",
             "function calling is not supported",
             "tool_choice",
+            "coding plan is currently only available for coding agents",
         ]
         .iter()
         .any(|hint| lower.contains(hint))
@@ -1442,6 +1457,21 @@ impl Provider for OpenAiCompatibleProvider {
         model: &str,
         temperature: f64,
     ) -> anyhow::Result<ProviderChatResponse> {
+        if !tools.is_empty() && self.forces_prompt_guided_tools_fallback() {
+            tracing::warn!(
+                provider = %self.name,
+                base_url = %self.base_url,
+                "Endpoint enforces prompt-guided tool fallback; native tool schema disabled"
+            );
+            let text = self.chat_with_history(messages, model, temperature).await?;
+            return Ok(ProviderChatResponse {
+                text: Some(text),
+                tool_calls: vec![],
+                usage: None,
+                reasoning_content: None,
+            });
+        }
+
         let credential = self.credential.as_ref().ok_or_else(|| {
             anyhow::anyhow!(
                 "{} API key not set. Run `zeroclaw onboard` or set the appropriate env var.",
@@ -1554,6 +1584,25 @@ impl Provider for OpenAiCompatibleProvider {
         model: &str,
         temperature: f64,
     ) -> anyhow::Result<ProviderChatResponse> {
+        if request.tools.is_some() && self.forces_prompt_guided_tools_fallback() {
+            tracing::warn!(
+                provider = %self.name,
+                base_url = %self.base_url,
+                "Endpoint enforces prompt-guided tool fallback; native tool schema disabled"
+            );
+            let fallback_messages =
+                Self::with_prompt_guided_tool_instructions(request.messages, request.tools);
+            let text = self
+                .chat_with_history(&fallback_messages, model, temperature)
+                .await?;
+            return Ok(ProviderChatResponse {
+                text: Some(text),
+                tool_calls: vec![],
+                usage: None,
+                reasoning_content: None,
+            });
+        }
+
         let credential = self.credential.as_ref().ok_or_else(|| {
             anyhow::anyhow!(
                 "{} API key not set. Run `zeroclaw onboard` or set the appropriate env var.",

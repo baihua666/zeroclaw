@@ -1,0 +1,158 @@
+# V821 设备端配置 — 阿里百练 (通过 relay 中转)
+#
+# 使用方式:
+#   1. 在 Mac/PC 上启动 relay:
+#      DASHSCOPE_API_KEY=sk-xxx ./v821/run-bailian-relay.sh
+#   2. 修改下方 RELAY_HOST_IP 为 Mac/PC 的局域网 IP
+#   3. 推送到设备:
+#      adb shell 'cp /mnt/UDISK/config-bailian.toml /tmp/zc_test_run/config.toml'
+#   4. 启动 daemon:
+#      ./v821/run-daemon.sh --lan --debug
+
+# V821 平台 TLS 不可用，通过云服务器 relay 中转 (HTTP→HTTPS)
+# relay: 120.24.23.161:19091 (bailian-relay.js, systemd 常驻)
+default_provider = "custom:http://120.24.23.161:19091/v1"
+default_model = "qwen3-coder-next"
+default_temperature = 0.7
+provider_timeout_secs = 120
+
+[model_providers]
+
+[extra_headers]
+
+[observability]
+backend = "none"
+runtime_trace_mode = "none"
+
+[autonomy]
+level = "supervised"
+workspace_only = true
+max_actions_per_hour = 20
+max_cost_per_day_cents = 500
+
+[security.sandbox]
+backend = "auto"
+
+[security.resources]
+max_memory_mb = 512
+max_cpu_time_seconds = 60
+max_subprocesses = 10
+memory_monitoring = true
+
+[security.audit]
+enabled = true
+log_path = "audit.log"
+max_size_mb = 100
+sign_events = false
+
+[security.otp]
+enabled = false
+
+[security.estop]
+enabled = false
+
+[security.nevis]
+enabled = false
+
+[runtime]
+kind = "native"
+
+[reliability]
+provider_retries = 2
+provider_backoff_ms = 500
+
+[reliability.model_fallbacks]
+
+[scheduler]
+enabled = true
+max_tasks = 64
+max_concurrent = 4
+
+[agent]
+compact_context = false
+max_tool_iterations = 10
+max_history_messages = 50
+max_context_tokens = 32000
+
+[skills]
+open_skills_enabled = false
+
+[query_classification]
+enabled = false
+
+[heartbeat]
+enabled = false
+interval_minutes = 30
+two_phase = true
+
+[cron]
+enabled = true
+max_run_history = 50
+
+[channels_config]
+cli = true
+message_timeout_secs = 300
+
+[memory]
+backend = "sqlite"
+auto_save = true
+hygiene_enabled = true
+embedding_provider = "none"
+auto_hydrate = true
+
+[tunnel]
+provider = "none"
+
+[gateway]
+port = 9091
+host = "0.0.0.0"
+require_pairing = true
+allow_public_bind = true
+
+[secrets]
+encrypt = true
+
+[browser]
+enabled = false
+
+[http_request]
+enabled = false
+
+[web_fetch]
+enabled = false
+
+[web_search]
+enabled = false
+
+[proxy]
+enabled = false
+
+[cost]
+enabled = false
+
+[peripherals]
+enabled = false
+
+[hooks]
+enabled = true
+
+[hardware]
+enabled = false
+
+[transcription]
+enabled = false
+
+[tts]
+enabled = false
+
+[mcp]
+enabled = false
+
+[nodes]
+enabled = false
+
+[workspace]
+enabled = false
+
+[node_transport]
+enabled = true

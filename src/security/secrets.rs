@@ -169,59 +169,59 @@ impl SecretStore {
 
     /// Load the encryption key from disk, or create one if it doesn't exist.
     fn load_or_create_key(&self) -> Result<Vec<u8>> {
-        if self.key_path.exists() {
-            let hex_key =
-                fs::read_to_string(&self.key_path).context("Failed to read secret key file")?;
-            hex_decode(hex_key.trim()).context("Secret key file is corrupt")
-        } else {
-            let key = generate_random_key();
-            if let Some(parent) = self.key_path.parent() {
-                fs::create_dir_all(parent)?;
-            }
-            fs::write(&self.key_path, hex_encode(&key))
-                .context("Failed to write secret key file")?;
+        match fs::read_to_string(&self.key_path) {
+            Ok(hex_key) => hex_decode(hex_key.trim()).context("Secret key file is corrupt"),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                let key = generate_random_key();
+                if let Some(parent) = self.key_path.parent() {
+                    fs::create_dir_all(parent)?;
+                }
+                fs::write(&self.key_path, hex_encode(&key))
+                    .context("Failed to write secret key file")?;
 
-            // Set restrictive permissions
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::PermissionsExt;
-                fs::set_permissions(&self.key_path, fs::Permissions::from_mode(0o600))
-                    .context("Failed to set key file permissions")?;
-            }
-            #[cfg(windows)]
-            {
-                // On Windows, use icacls to restrict permissions to current user only
-                let username = std::env::var("USERNAME").unwrap_or_default();
-                let Some(grant_arg) = build_windows_icacls_grant_arg(&username) else {
-                    tracing::warn!(
-                        "USERNAME environment variable is empty; \
-                         cannot restrict key file permissions via icacls"
-                    );
-                    return Ok(key);
-                };
-
-                match std::process::Command::new("icacls")
-                    .arg(&self.key_path)
-                    .args(["/inheritance:r", "/grant:r"])
-                    .arg(grant_arg)
-                    .output()
+                // Set restrictive permissions
+                #[cfg(unix)]
                 {
-                    Ok(o) if !o.status.success() => {
+                    use std::os::unix::fs::PermissionsExt;
+                    fs::set_permissions(&self.key_path, fs::Permissions::from_mode(0o600))
+                        .context("Failed to set key file permissions")?;
+                }
+                #[cfg(windows)]
+                {
+                    // On Windows, use icacls to restrict permissions to current user only
+                    let username = std::env::var("USERNAME").unwrap_or_default();
+                    let Some(grant_arg) = build_windows_icacls_grant_arg(&username) else {
                         tracing::warn!(
-                            "Failed to set key file permissions via icacls (exit code {:?})",
-                            o.status.code()
+                            "USERNAME environment variable is empty; \
+                             cannot restrict key file permissions via icacls"
                         );
-                    }
-                    Err(e) => {
-                        tracing::warn!("Could not set key file permissions: {e}");
-                    }
-                    _ => {
-                        tracing::debug!("Key file permissions restricted via icacls");
+                        return Ok(key);
+                    };
+
+                    match std::process::Command::new("icacls")
+                        .arg(&self.key_path)
+                        .args(["/inheritance:r", "/grant:r"])
+                        .arg(grant_arg)
+                        .output()
+                    {
+                        Ok(o) if !o.status.success() => {
+                            tracing::warn!(
+                                "Failed to set key file permissions via icacls (exit code {:?})",
+                                o.status.code()
+                            );
+                        }
+                        Err(e) => {
+                            tracing::warn!("Could not set key file permissions: {e}");
+                        }
+                        _ => {
+                            tracing::debug!("Key file permissions restricted via icacls");
+                        }
                     }
                 }
-            }
 
-            Ok(key)
+                Ok(key)
+            }
+            Err(err) => Err(err).context("Failed to read secret key file"),
         }
     }
 }

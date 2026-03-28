@@ -8,14 +8,41 @@ use tokio::time::Duration;
 
 const STATUS_FLUSH_SECONDS: u64 = 5;
 
+fn v821_debug_enabled() -> bool {
+    cfg!(feature = "v821") && std::env::var_os("ZEROCLAW_V821_DEBUG").is_some()
+}
+
+fn v821_debug_stage(stage: &str) {
+    if v821_debug_enabled() {
+        eprintln!("[v821-debug][daemon] {stage}");
+    }
+}
+
+#[cfg(all(unix, feature = "v821"))]
+fn v821_path_accessible(path: &std::path::Path) -> bool {
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt;
+
+    let Ok(path_cstr) = CString::new(path.as_os_str().as_bytes()) else {
+        return false;
+    };
+
+    unsafe { libc::access(path_cstr.as_ptr(), libc::F_OK) == 0 }
+}
+
 /// Wait for shutdown signal (SIGINT or SIGTERM)
 async fn wait_for_shutdown_signal() -> Result<()> {
     #[cfg(unix)]
     {
         use tokio::signal::unix::{signal, SignalKind};
 
+        v821_debug_stage("wait_for_shutdown_signal:unix:register_sigint:start");
         let mut sigint = signal(SignalKind::interrupt())?;
+        v821_debug_stage("wait_for_shutdown_signal:unix:register_sigint:done");
+        v821_debug_stage("wait_for_shutdown_signal:unix:register_sigterm:start");
         let mut sigterm = signal(SignalKind::terminate())?;
+        v821_debug_stage("wait_for_shutdown_signal:unix:register_sigterm:done");
+        v821_debug_stage("wait_for_shutdown_signal:unix:select:start");
 
         tokio::select! {
             _ = sigint.recv() => {
@@ -29,14 +56,18 @@ async fn wait_for_shutdown_signal() -> Result<()> {
 
     #[cfg(not(unix))]
     {
+        v821_debug_stage("wait_for_shutdown_signal:ctrl_c:start");
         tokio::signal::ctrl_c().await?;
+        v821_debug_stage("wait_for_shutdown_signal:ctrl_c:done");
         tracing::info!("Received Ctrl+C, shutting down...");
     }
 
+    v821_debug_stage("wait_for_shutdown_signal:done");
     Ok(())
 }
 
 pub async fn run(config: Config, host: String, port: u16) -> Result<()> {
+    v821_debug_stage("run:start");
     let initial_backoff = config.reliability.channel_initial_backoff_secs.max(1);
     let max_backoff = config
         .reliability
@@ -44,18 +75,34 @@ pub async fn run(config: Config, host: String, port: u16) -> Result<()> {
         .max(initial_backoff);
 
     crate::health::mark_component_ok("daemon");
+    v821_debug_stage("run:health_marked");
 
     if config.heartbeat.enabled {
+        v821_debug_stage("run:heartbeat_file_ensure:start");
         let _ =
             crate::heartbeat::engine::HeartbeatEngine::ensure_heartbeat_file(&config.workspace_dir)
                 .await;
+        v821_debug_stage("run:heartbeat_file_ensure:done");
     }
 
-    let mut handles: Vec<JoinHandle<()>> = vec![spawn_state_writer(config.clone())];
+    let mut handles: Vec<JoinHandle<()>> = Vec::new();
+    #[cfg(feature = "v821")]
+    {
+        // On V821, recurring state-writer ticks are unstable in long-running daemon mode.
+        // Keep daemon available first; state JSON will be skipped on this target.
+        v821_debug_stage("run:spawn_state_writer:skipped:v821");
+    }
+    #[cfg(not(feature = "v821"))]
+    {
+        v821_debug_stage("run:spawn_state_writer:start");
+        handles.push(spawn_state_writer(config.clone()));
+        v821_debug_stage("run:spawn_state_writer:done");
+    }
 
     {
         let gateway_cfg = config.clone();
         let gateway_host = host.clone();
+        v821_debug_stage("run:spawn_gateway_supervisor:start");
         handles.push(spawn_component_supervisor(
             "gateway",
             initial_backoff,
@@ -66,11 +113,13 @@ pub async fn run(config: Config, host: String, port: u16) -> Result<()> {
                 async move { crate::gateway::run_gateway(&host, port, cfg).await }
             },
         ));
+        v821_debug_stage("run:spawn_gateway_supervisor:done");
     }
 
     {
         if has_supervised_channels(&config) {
             let channels_cfg = config.clone();
+            v821_debug_stage("run:spawn_channels_supervisor:start");
             handles.push(spawn_component_supervisor(
                 "channels",
                 initial_backoff,
@@ -80,56 +129,87 @@ pub async fn run(config: Config, host: String, port: u16) -> Result<()> {
                     async move { Box::pin(crate::channels::start_channels(cfg)).await }
                 },
             ));
+            v821_debug_stage("run:spawn_channels_supervisor:done");
         } else {
             crate::health::mark_component_ok("channels");
             tracing::info!("No real-time channels configured; channel supervisor disabled");
+            v821_debug_stage("run:channels_supervisor:skipped");
         }
     }
 
-    if config.heartbeat.enabled {
-        let heartbeat_cfg = config.clone();
-        handles.push(spawn_component_supervisor(
-            "heartbeat",
-            initial_backoff,
-            max_backoff,
-            move || {
-                let cfg = heartbeat_cfg.clone();
-                async move { Box::pin(run_heartbeat_worker(cfg)).await }
-            },
-        ));
+    #[cfg(feature = "v821")]
+    {
+        crate::health::mark_component_ok("heartbeat");
+        tracing::info!("V821 fallback: heartbeat supervisor disabled");
+        v821_debug_stage("run:heartbeat_supervisor:skipped:v821");
+    }
+    #[cfg(not(feature = "v821"))]
+    {
+        if config.heartbeat.enabled {
+            let heartbeat_cfg = config.clone();
+            v821_debug_stage("run:spawn_heartbeat_supervisor:start");
+            handles.push(spawn_component_supervisor(
+                "heartbeat",
+                initial_backoff,
+                max_backoff,
+                move || {
+                    let cfg = heartbeat_cfg.clone();
+                    async move { Box::pin(run_heartbeat_worker(cfg)).await }
+                },
+            ));
+            v821_debug_stage("run:spawn_heartbeat_supervisor:done");
+        }
     }
 
-    if config.cron.enabled {
-        let scheduler_cfg = config.clone();
-        handles.push(spawn_component_supervisor(
-            "scheduler",
-            initial_backoff,
-            max_backoff,
-            move || {
-                let cfg = scheduler_cfg.clone();
-                async move { crate::cron::scheduler::run(cfg).await }
-            },
-        ));
-    } else {
+    #[cfg(feature = "v821")]
+    {
         crate::health::mark_component_ok("scheduler");
-        tracing::info!("Cron disabled; scheduler supervisor not started");
+        tracing::info!("V821 fallback: scheduler supervisor disabled");
+        v821_debug_stage("run:scheduler_supervisor:skipped:v821");
+    }
+    #[cfg(not(feature = "v821"))]
+    {
+        if config.cron.enabled {
+            let scheduler_cfg = config.clone();
+            v821_debug_stage("run:spawn_scheduler_supervisor:start");
+            handles.push(spawn_component_supervisor(
+                "scheduler",
+                initial_backoff,
+                max_backoff,
+                move || {
+                    let cfg = scheduler_cfg.clone();
+                    async move { crate::cron::scheduler::run(cfg).await }
+                },
+            ));
+            v821_debug_stage("run:spawn_scheduler_supervisor:done");
+        } else {
+            crate::health::mark_component_ok("scheduler");
+            tracing::info!("Cron disabled; scheduler supervisor not started");
+            v821_debug_stage("run:scheduler_supervisor:skipped");
+        }
     }
 
+    v821_debug_stage("run:startup_banner:start");
     println!("🧠 ZeroClaw daemon started");
     println!("   Gateway:  http://{host}:{port}");
     println!("   Components: gateway, channels, heartbeat, scheduler");
     println!("   Ctrl+C or SIGTERM to stop");
+    v821_debug_stage("run:startup_banner:done");
 
     // Wait for shutdown signal (SIGINT or SIGTERM)
+    v821_debug_stage("run:wait_for_shutdown_signal:start");
     wait_for_shutdown_signal().await?;
+    v821_debug_stage("run:wait_for_shutdown_signal:done");
     crate::health::mark_component_error("daemon", "shutdown requested");
 
+    v821_debug_stage("run:abort_handles:start");
     for handle in &handles {
         handle.abort();
     }
     for handle in handles {
         let _ = handle.await;
     }
+    v821_debug_stage("run:abort_handles:done");
 
     Ok(())
 }
@@ -144,14 +224,24 @@ pub fn state_file_path(config: &Config) -> PathBuf {
 
 fn spawn_state_writer(config: Config) -> JoinHandle<()> {
     tokio::spawn(async move {
+        v821_debug_stage("state_writer:task:start");
         let path = state_file_path(&config);
+        v821_debug_stage("state_writer:path_resolved");
         if let Some(parent) = path.parent() {
+            v821_debug_stage("state_writer:create_dir_all:start");
+            #[cfg(feature = "v821")]
+            {
+                if !v821_path_accessible(parent) {
+                    let _ = std::fs::create_dir_all(parent);
+                }
+            }
+            #[cfg(not(feature = "v821"))]
             let _ = tokio::fs::create_dir_all(parent).await;
+            v821_debug_stage("state_writer:create_dir_all:done");
         }
 
-        let mut interval = tokio::time::interval(Duration::from_secs(STATUS_FLUSH_SECONDS));
         loop {
-            interval.tick().await;
+            v821_debug_stage("state_writer:tick:start");
             let mut json = crate::health::snapshot_json();
             if let Some(obj) = json.as_object_mut() {
                 obj.insert(
@@ -160,7 +250,15 @@ fn spawn_state_writer(config: Config) -> JoinHandle<()> {
                 );
             }
             let data = serde_json::to_vec_pretty(&json).unwrap_or_else(|_| b"{}".to_vec());
+            v821_debug_stage("state_writer:write:start");
+            #[cfg(feature = "v821")]
+            let _ = std::fs::write(&path, data);
+            #[cfg(not(feature = "v821"))]
             let _ = tokio::fs::write(&path, data).await;
+            v821_debug_stage("state_writer:write:done");
+            v821_debug_stage("state_writer:sleep:start");
+            tokio::time::sleep(Duration::from_secs(STATUS_FLUSH_SECONDS)).await;
+            v821_debug_stage("state_writer:sleep:done");
         }
     })
 }
@@ -176,28 +274,35 @@ where
     Fut: Future<Output = Result<()>> + Send + 'static,
 {
     tokio::spawn(async move {
+        v821_debug_stage(&format!("supervisor:{name}:task:start"));
         let mut backoff = initial_backoff_secs.max(1);
         let max_backoff = max_backoff_secs.max(backoff);
 
         loop {
+            v821_debug_stage(&format!("supervisor:{name}:iteration:start"));
             crate::health::mark_component_ok(name);
+            v821_debug_stage(&format!("supervisor:{name}:run_component:start"));
             match run_component().await {
                 Ok(()) => {
+                    v821_debug_stage(&format!("supervisor:{name}:run_component:ok"));
                     crate::health::mark_component_error(name, "component exited unexpectedly");
                     tracing::warn!("Daemon component '{name}' exited unexpectedly");
                     // Clean exit — reset backoff since the component ran successfully
                     backoff = initial_backoff_secs.max(1);
                 }
                 Err(e) => {
+                    v821_debug_stage(&format!("supervisor:{name}:run_component:err"));
                     crate::health::mark_component_error(name, e.to_string());
                     tracing::error!("Daemon component '{name}' failed: {e}");
                 }
             }
 
             crate::health::bump_component_restart(name);
+            v821_debug_stage(&format!("supervisor:{name}:sleep:start"));
             tokio::time::sleep(Duration::from_secs(backoff)).await;
             // Double backoff AFTER sleeping so first error uses initial_backoff
             backoff = backoff.saturating_mul(2).min(max_backoff);
+            v821_debug_stage(&format!("supervisor:{name}:sleep:done"));
         }
     })
 }

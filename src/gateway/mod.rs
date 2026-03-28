@@ -330,6 +330,7 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         );
     }
     let config_state = Arc::new(Mutex::new(config.clone()));
+    eprintln!("[gateway-init] config cloned");
 
     // ── Hooks ──────────────────────────────────────────────────────
     let hooks: Option<std::sync::Arc<crate::hooks::HookRunner>> = if config.hooks.enabled {
@@ -337,12 +338,15 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
     } else {
         None
     };
+    eprintln!("[gateway-init] hooks ready");
 
     let addr: SocketAddr = format!("{host}:{port}").parse()?;
     let listener = tokio::net::TcpListener::bind(addr).await?;
     let actual_port = listener.local_addr()?.port();
     let display_addr = format!("{host}:{actual_port}");
+    eprintln!("[gateway-init] listener bound at {display_addr}");
 
+    eprintln!("[gateway-init] creating provider");
     let provider: Arc<dyn Provider> = Arc::from(providers::create_resilient_provider_with_options(
         config.default_provider.as_deref().unwrap_or("openrouter"),
         config.api_key.as_deref(),
@@ -359,11 +363,13 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
             api_path: config.api_path.clone(),
         },
     )?);
+    eprintln!("[gateway-init] provider ready");
     let model = config
         .default_model
         .clone()
         .unwrap_or_else(|| "anthropic/claude-sonnet-4".into());
     let temperature = config.default_temperature;
+    eprintln!("[gateway-init] creating memory");
     let mem: Arc<dyn Memory> = Arc::from(memory::create_memory_with_storage_and_routes(
         &config.memory,
         &config.embedding_routes,
@@ -371,12 +377,16 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         &config.workspace_dir,
         config.api_key.as_deref(),
     )?);
+    eprintln!("[gateway-init] memory ready");
+    eprintln!("[gateway-init] creating runtime");
     let runtime: Arc<dyn runtime::RuntimeAdapter> =
         Arc::from(runtime::create_runtime(&config.runtime)?);
+    eprintln!("[gateway-init] runtime ready");
     let security = Arc::new(SecurityPolicy::from_config(
         &config.autonomy,
         &config.workspace_dir,
     ));
+    eprintln!("[gateway-init] security ready");
 
     let (composio_key, composio_entity_id) = if config.composio.enabled {
         (
@@ -387,6 +397,7 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         (None, None)
     };
 
+    eprintln!("[gateway-init] creating tools");
     let (tools_registry_raw, _delegate_handle_gw) = tools::all_tools_with_runtime(
         Arc::new(config.clone()),
         &security,
@@ -402,8 +413,10 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         config.api_key.as_deref(),
         &config,
     );
+    eprintln!("[gateway-init] tools ready");
     let tools_registry: Arc<Vec<ToolSpec>> =
         Arc::new(tools_registry_raw.iter().map(|t| t.spec()).collect());
+    eprintln!("[gateway-init] tool specs ready");
 
     // Cost tracker (optional)
     let cost_tracker = if config.cost.enabled {
@@ -420,6 +433,7 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
 
     // SSE broadcast channel for real-time events
     let (event_tx, _event_rx) = tokio::sync::broadcast::channel::<serde_json::Value>(256);
+    eprintln!("[gateway-init] event bus ready");
     // Extract webhook secret for authentication
     let webhook_secret_hash: Option<Arc<str>> =
         config.channels_config.webhook.as_ref().and_then(|webhook| {
@@ -542,6 +556,7 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         config.gateway.require_pairing,
         &config.gateway.paired_tokens,
     ));
+    eprintln!("[gateway-init] pairing ready");
     let rate_limit_max_keys = normalize_max_keys(
         config.gateway.rate_limit_max_keys,
         RATE_LIMIT_MAX_KEYS_DEFAULT,
@@ -563,6 +578,7 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
     // ── Tunnel ────────────────────────────────────────────────
     let tunnel = crate::tunnel::create_tunnel(&config.tunnel)?;
     let mut tunnel_url: Option<String> = None;
+    eprintln!("[gateway-init] tunnel ready");
 
     if let Some(ref tun) = tunnel {
         println!("🔗 Starting {} tunnel...", tun.name());
@@ -633,6 +649,7 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
             crate::observability::create_observer(&config.observability),
             event_tx.clone(),
         ));
+    eprintln!("[gateway-init] observer ready");
 
     let (shutdown_tx, mut shutdown_rx) = tokio::sync::watch::channel(false);
 
@@ -665,11 +682,13 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         shutdown_tx,
         node_registry,
     };
+    eprintln!("[gateway-init] state ready");
 
     // Config PUT needs larger body limit (1MB)
     let config_put_router = Router::new()
         .route("/api/config", put(api::handle_api_config_put))
         .layer(RequestBodyLimitLayer::new(1_048_576));
+    eprintln!("[gateway-init] config router ready");
 
     // Build router with middleware
     let app = Router::new()
@@ -729,6 +748,7 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         ))
         // ── SPA fallback: non-API GET requests serve index.html ──
         .fallback(get(static_files::handle_spa_fallback));
+    eprintln!("[gateway-init] app ready");
 
     // Run the server with graceful shutdown
     axum::serve(
@@ -822,6 +842,23 @@ async fn handle_pair(
     match state.pairing.try_pair(code, &rate_key).await {
         Ok(Some(token)) => {
             tracing::info!("🔐 New client paired successfully");
+            #[cfg(feature = "v821")]
+            {
+                // V821 compatibility: persisting full config after pairing can crash on some
+                // runtimes. Keep pairing token in-process and return a clear non-persisted status.
+                tracing::warn!(
+                    "🔐 V821 mode: skipping paired token persistence to avoid runtime crash"
+                );
+                let body = serde_json::json!({
+                    "paired": true,
+                    "persisted": false,
+                    "token": token,
+                    "message": "Paired for this process on V821. Token persistence is skipped in V821 mode to avoid runtime crashes; re-pair after restart.",
+                });
+                return (StatusCode::OK, Json(body));
+            }
+
+            #[cfg(not(feature = "v821"))]
             if let Err(err) = persist_pairing_tokens(state.config.clone(), &state.pairing).await {
                 tracing::error!("🔐 Pairing succeeded but token persistence failed: {err:#}");
                 let body = serde_json::json!({

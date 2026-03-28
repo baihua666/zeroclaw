@@ -10,6 +10,7 @@ fn main() {
     println!("cargo:rerun-if-changed=web/index.html");
     println!("cargo:rerun-if-changed=web/package.json");
     println!("cargo:rerun-if-changed=web/vite.config.ts");
+    println!("cargo:rerun-if-changed=web/dist");
 
     // Attempt to build the web frontend if npm is available and web/dist is
     // missing or stale.  The build is best-effort: when Node.js is not

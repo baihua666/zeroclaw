@@ -1224,9 +1224,25 @@ fn models_endpoint_for_provider(provider_name: &str) -> Option<&'static str> {
 }
 
 fn build_model_fetch_client() -> Result<reqwest::blocking::Client> {
-    reqwest::blocking::Client::builder()
+    let connect_timeout_secs = if cfg!(feature = "v821") { 10 } else { 4 };
+    let mut builder = reqwest::blocking::Client::builder()
         .timeout(Duration::from_secs(8))
-        .connect_timeout(Duration::from_secs(4))
+        .connect_timeout(Duration::from_secs(connect_timeout_secs));
+
+    if std::env::var("ZEROCLAW_INSECURE_TLS")
+        .ok()
+        .map(|value| {
+            matches!(
+                value.trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes" | "on"
+            )
+        })
+        .unwrap_or(false)
+    {
+        builder = builder.danger_accept_invalid_certs(true);
+    }
+
+    builder
         .build()
         .context("failed to build model-fetch HTTP client")
 }
@@ -1572,6 +1588,19 @@ fn fetch_live_models_for_provider(
     Ok(models)
 }
 
+fn is_custom_provider_name(provider_name: &str) -> bool {
+    provider_name.trim().starts_with("custom:")
+}
+
+fn is_model_discovery_unsupported_error(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        let message = cause.to_string();
+        message.contains("405 Method Not Allowed")
+            || message.contains("404 Not Found")
+            || message.contains("403 Forbidden")
+    })
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct ModelCacheEntry {
     provider: String,
@@ -1825,6 +1854,19 @@ pub async fn run_models_refresh(
                     humanize_age(stale_cache.age_secs)
                 );
                 print_model_preview(&stale_cache.models);
+                return Ok(());
+            }
+
+            if is_custom_provider_name(&provider_name)
+                && is_model_discovery_unsupported_error(&error)
+            {
+                println!(
+                    "Live model discovery is not supported by '{}' endpoint yet ({}).",
+                    provider_name, error
+                );
+                println!(
+                    "Tip: set default_model directly, then use `zeroclaw agent -m ...` to validate requests."
+                );
                 return Ok(());
             }
 

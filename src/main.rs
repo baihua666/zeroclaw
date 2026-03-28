@@ -42,6 +42,16 @@ use std::path::PathBuf;
 use tracing::{info, warn};
 use tracing_subscriber::{fmt, EnvFilter};
 
+fn v821_debug_enabled() -> bool {
+    cfg!(feature = "v821") && std::env::var_os("ZEROCLAW_V821_DEBUG").is_some()
+}
+
+fn v821_debug_stage(stage: &str) {
+    if v821_debug_enabled() {
+        eprintln!("[v821-debug] {stage}");
+    }
+}
+
 fn parse_temperature(s: &str) -> std::result::Result<f64, String> {
     let t: f64 = s.parse().map_err(|e| format!("{e}"))?;
     config::schema::validate_temperature(t)
@@ -679,9 +689,43 @@ enum MemoryCommands {
     },
 }
 
-#[tokio::main]
+fn main() -> Result<()> {
+    if std::env::args_os().len() <= 1 {
+        return print_no_command_help();
+    }
+
+    let cli = Cli::parse();
+
+    // Keep stdout-only commands out of async runtime initialization so
+    // startup-critical targets can still serve help/version/completions.
+    if let Commands::Completions { shell } = &cli.command {
+        let mut stdout = std::io::stdout().lock();
+        write_shell_completion(*shell, &mut stdout)?;
+        return Ok(());
+    }
+
+    v821_debug_stage("runtime:build:start");
+    #[cfg(feature = "v821")]
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .context("Failed to initialize Tokio runtime")?;
+
+    #[cfg(not(feature = "v821"))]
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .context("Failed to initialize Tokio runtime")?;
+
+    v821_debug_stage("runtime:build:done");
+    v821_debug_stage("runtime:block_on:start");
+    runtime.block_on(async_main(cli))
+}
+
 #[allow(clippy::too_many_lines)]
-async fn main() -> Result<()> {
+async fn async_main(cli: Cli) -> Result<()> {
+    v821_debug_stage("async_main:enter");
+
     // Install default crypto provider for Rustls TLS.
     // This prevents the error: "could not automatically determine the process-level CryptoProvider"
     // when the selected build enables a provider but nothing installs it at runtime.
@@ -694,12 +738,6 @@ async fn main() -> Result<()> {
         eprintln!("Warning: Failed to install default crypto provider: {e:?}");
     }
 
-    if std::env::args_os().len() <= 1 {
-        return print_no_command_help();
-    }
-
-    let cli = Cli::parse();
-
     if let Some(config_dir) = &cli.config_dir {
         if config_dir.trim().is_empty() {
             bail!("--config-dir cannot be empty");
@@ -707,14 +745,7 @@ async fn main() -> Result<()> {
         std::env::set_var("ZEROCLAW_CONFIG_DIR", config_dir);
     }
 
-    // Completions must remain stdout-only and should not load config or initialize logging.
-    // This avoids warnings/log lines corrupting sourced completion scripts.
-    if let Commands::Completions { shell } = &cli.command {
-        let mut stdout = std::io::stdout().lock();
-        write_shell_completion(*shell, &mut stdout)?;
-        return Ok(());
-    }
-
+    v821_debug_stage("logging:init:start");
     // Initialize logging - respects RUST_LOG env var, defaults to INFO
     let subscriber = fmt::Subscriber::builder()
         .with_env_filter(
@@ -723,6 +754,7 @@ async fn main() -> Result<()> {
         .finish();
 
     tracing::subscriber::set_global_default(subscriber).expect("setting default subscriber failed");
+    v821_debug_stage("logging:init:done");
 
     // Onboard auto-detects the environment: if stdin/stdout are a TTY and no
     // provider flags were given, it runs the full interactive wizard; otherwise
@@ -855,10 +887,19 @@ async fn main() -> Result<()> {
     }
 
     // All other commands need config loaded first
+    v821_debug_stage("config:load:start");
     let mut config = Config::load_or_init().await?;
+    v821_debug_stage("config:load:done");
+
+    v821_debug_stage("config:env_overrides:start");
     config.apply_env_overrides();
+    v821_debug_stage("config:env_overrides:done");
+
+    v821_debug_stage("observability:init:start");
     observability::runtime_trace::init_from_config(&config.observability, &config.workspace_dir);
+    v821_debug_stage("observability:init:done");
     if config.security.otp.enabled {
+        v821_debug_stage("otp:init:start");
         let config_dir = config
             .config_path
             .parent()
@@ -870,8 +911,10 @@ async fn main() -> Result<()> {
             println!("Initialized OTP secret for ZeroClaw.");
             println!("Enrollment URI: {uri}");
         }
+        v821_debug_stage("otp:init:done");
     }
 
+    v821_debug_stage("dispatch:start");
     match cli.command {
         Commands::Onboard { .. } | Commands::Completions { .. } => unreachable!(),
 
@@ -997,6 +1040,7 @@ async fn main() -> Result<()> {
         }
 
         Commands::Daemon { port, host } => {
+            v821_debug_stage("dispatch:daemon:enter");
             let port = port.unwrap_or(config.gateway.port);
             let host = host.unwrap_or_else(|| config.gateway.host.clone());
             if port == 0 {
@@ -1004,7 +1048,9 @@ async fn main() -> Result<()> {
             } else {
                 info!("🧠 Starting ZeroClaw Daemon on {host}:{port}");
             }
-            daemon::run(config, host, port).await
+            let result = daemon::run(config, host, port).await;
+            v821_debug_stage("dispatch:daemon:return");
+            result
         }
 
         Commands::Status => {
@@ -1177,20 +1223,35 @@ async fn main() -> Result<()> {
             Some(DoctorCommands::Models {
                 provider,
                 use_cache,
-            }) => doctor::run_models(&config, provider.as_deref(), use_cache).await,
+            }) => {
+                v821_debug_stage("dispatch:doctor_models:enter");
+                let result = doctor::run_models(&config, provider.as_deref(), use_cache).await;
+                v821_debug_stage("dispatch:doctor_models:return");
+                result
+            }
             Some(DoctorCommands::Traces {
                 id,
                 event,
                 contains,
                 limit,
-            }) => doctor::run_traces(
-                &config,
-                id.as_deref(),
-                event.as_deref(),
-                contains.as_deref(),
-                limit,
-            ),
-            None => doctor::run(&config),
+            }) => {
+                v821_debug_stage("dispatch:doctor_traces:enter");
+                let result = doctor::run_traces(
+                    &config,
+                    id.as_deref(),
+                    event.as_deref(),
+                    contains.as_deref(),
+                    limit,
+                );
+                v821_debug_stage("dispatch:doctor_traces:return");
+                result
+            }
+            None => {
+                v821_debug_stage("dispatch:doctor:enter");
+                let result = doctor::run(&config);
+                v821_debug_stage("dispatch:doctor:return");
+                result
+            }
         },
 
         Commands::Channel { channel_command } => match channel_command {
@@ -1213,7 +1274,12 @@ async fn main() -> Result<()> {
             memory::cli::handle_command(memory_command, &config).await
         }
 
-        Commands::Auth { auth_command } => handle_auth_command(auth_command, &config).await,
+        Commands::Auth { auth_command } => {
+            v821_debug_stage("dispatch:auth:enter");
+            let result = handle_auth_command(auth_command, &config).await;
+            v821_debug_stage("dispatch:auth:return");
+            result
+        }
 
         Commands::Hardware { hardware_command } => {
             hardware::handle_command(hardware_command.clone(), &config)
@@ -1666,7 +1732,9 @@ fn format_expiry(profile: &auth::profiles::AuthProfile) -> String {
 
 #[allow(clippy::too_many_lines)]
 async fn handle_auth_command(auth_command: AuthCommands, config: &Config) -> Result<()> {
+    v821_debug_stage("handle_auth_command:start");
     let auth_service = auth::AuthService::from_config(config);
+    v821_debug_stage("handle_auth_command:auth_service_ready");
 
     match auth_command {
         AuthCommands::Login {
@@ -2074,7 +2142,9 @@ async fn handle_auth_command(auth_command: AuthCommands, config: &Config) -> Res
         }
 
         AuthCommands::List => {
+            v821_debug_stage("handle_auth_command:list:load_profiles:start");
             let data = auth_service.load_profiles().await?;
+            v821_debug_stage("handle_auth_command:list:load_profiles:done");
             if data.profiles.is_empty() {
                 println!("No auth profiles configured.");
                 return Ok(());
@@ -2093,7 +2163,9 @@ async fn handle_auth_command(auth_command: AuthCommands, config: &Config) -> Res
         }
 
         AuthCommands::Status => {
+            v821_debug_stage("handle_auth_command:status:load_profiles:start");
             let data = auth_service.load_profiles().await?;
+            v821_debug_stage("handle_auth_command:status:load_profiles:done");
             if data.profiles.is_empty() {
                 println!("No auth profiles configured.");
                 return Ok(());

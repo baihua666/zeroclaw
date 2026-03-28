@@ -44,8 +44,9 @@ tokio-stream = { version = "0.1.18", default-features = false, features = ["fs",
 
 # HTTP client - minimal features
 # Note: For V821, use aws-lc-rs for TLS (ring doesn't support RISC-V 32-bit)
-# Use rustls-tls-no-provider to avoid ring dependency
-reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls-no-provider", "blocking", "multipart", "stream", "socks"] }
+# Use rustls without ring, but keep embedded WebPKI roots so standalone devices
+# can validate public HTTPS endpoints without relying on an OS certificate store.
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls-webpki-roots-no-provider", "blocking", "multipart", "stream", "socks"] }
 
 # Matrix client + E2EE decryption
 matrix-sdk = { version = "0.16", optional = true, default-features = false, features = ["e2e-encryption", "rustls-tls", "markdown", "sqlite"] }
@@ -220,8 +221,8 @@ tokio-rustls = { version = "0.26.4", default-features = false, features = ["aws-
 default = ["observability-prometheus", "channel-nostr", "ring"]
 
 # V821 feature: for Allwinner V821 (RISC-V 32-bit, Tina Linux)
-# Uses aws-lc-rs for TLS (supports RISC-V 32-bit, unlike ring)
-# Disables prometheus (requires 64-bit atomics) and ring
+# Uses aws-lc-rs for non-TLS crypto. HTTPS handled via cloud relay (HTTP→HTTPS)
+# because both aws-lc-rs and OpenSSL TLS handshakes fail on rv32.
 v821 = ["dep:aws-lc-rs"]
 
 # Ring feature: enables ring-based crypto and TLS (default, not available on RISC-V 32-bit)

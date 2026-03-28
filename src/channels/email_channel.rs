@@ -31,9 +31,9 @@ use tokio_rustls::TlsConnector;
 use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
+use super::email_config::EmailConfig;
 #[cfg(test)]
 use super::email_config::{default_imap_folder, default_imap_port, default_smtp_port};
-use super::email_config::EmailConfig;
 use super::traits::{Channel, ChannelMessage, SendMessage};
 
 type ImapSession = Session<TlsStream<TcpStream>>;

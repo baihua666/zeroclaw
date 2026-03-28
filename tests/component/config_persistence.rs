@@ -166,6 +166,41 @@ fn config_toml_roundtrip_preserves_memory_config() {
     assert!((parsed.memory.keyword_weight - 0.2).abs() < f64::EPSILON);
 }
 
+#[test]
+fn config_with_partial_memory_section_uses_backward_compatible_defaults() {
+    let toml_str = r#"
+default_temperature = 0.7
+
+[memory]
+embedding_provider = "none"
+"#;
+
+    let parsed: Config = toml::from_str(toml_str).expect("partial memory config should parse");
+
+    assert_eq!(parsed.memory.backend, "sqlite");
+    assert!(parsed.memory.auto_save);
+    assert_eq!(parsed.memory.embedding_provider, "none");
+}
+
+#[test]
+fn config_toml_roundtrip_omits_empty_route_tables() {
+    let config = Config::default();
+
+    let toml_str = toml::to_string(&config).expect("config should serialize to TOML");
+    let parsed: Config = toml::from_str(&toml_str).expect("TOML should deserialize back");
+
+    assert!(
+        !toml_str.contains("[[model_routes]]"),
+        "empty model_routes should not be serialized"
+    );
+    assert!(
+        !toml_str.contains("[[embedding_routes]]"),
+        "empty embedding_routes should not be serialized"
+    );
+    assert!(parsed.model_routes.is_empty());
+    assert!(parsed.embedding_routes.is_empty());
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Config file write/read round-trip with tempdir
 // ─────────────────────────────────────────────────────────────────────────────

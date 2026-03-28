@@ -88,3 +88,16 @@ Branch/commit/PR rules:
 - `@docs/contributing/change-playbooks.md` — adding providers, channels, tools, peripherals; security/gateway changes; architecture boundaries
 - `@docs/contributing/pr-discipline.md` — privacy rules, superseded-PR attribution/templates, handoff template
 - `@docs/contributing/docs-contract.md` — docs system contract, i18n rules, locale parity
+
+## Environment Context (V821)
+
+- ADB can directly connect to the V821 RISC-V 32-bit development board.
+- App binary path on device: `/mnt/UDISK/zeroclaw`.
+- If device-side information, debugging, or runtime verification is needed, use `adb` commands directly.
+- Current local project path is an SSHFS mount from a remote Ubuntu server.
+- Canonical project path on the server: `/home/tubao/code/zeroclaw`.
+- Cross-compilation must be done on the Ubuntu server.
+- SSH access for server-side build/debug: `ssh root@120.24.23.161`.
+
+## 代码修改
+- 把v821相关的编译脚本,运行脚本等定制代码,统一放到 zeroclaw/v821目录, 尽量少修改框架原始代码，优先通过参数传入，更上层的使用方面进行适配，减少后续维护成本

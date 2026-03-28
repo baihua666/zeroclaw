@@ -1,0 +1,24 @@
+[package]
+name = "hello-tls"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+# TLS backend 1: rustls + aws-lc-rs (zeroclaw 当前方案)
+rustls = { version = "0.23", default-features = false, features = ["aws_lc_rs", "std", "tls12"] }
+aws-lc-rs = "1.0"
+webpki-roots = "1.0"
+rustls-pki-types = "1.14"
+
+# TLS backend 2: native-tls (OpenSSL)
+native-tls = "0.2"
+
+# HTTP (可选，用于完整 HTTP 测试)
+# reqwest 太重，用底层 TCP 直接测
+
+[profile.release-v821]
+inherits = "release"
+opt-level = "z"
+lto = "thin"
+codegen-units = 1
+strip = true

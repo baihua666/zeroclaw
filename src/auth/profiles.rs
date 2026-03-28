@@ -3,10 +3,13 @@ use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
+use std::fs as stdfs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
+#[cfg(not(feature = "v821"))]
 use tokio::fs::{self, OpenOptions};
+#[cfg(not(feature = "v821"))]
 use tokio::io::AsyncWriteExt;
 use tokio::time::sleep;
 
@@ -15,6 +18,16 @@ const PROFILES_FILENAME: &str = "auth-profiles.json";
 const LOCK_FILENAME: &str = "auth-profiles.lock";
 const LOCK_WAIT_MS: u64 = 50;
 const LOCK_TIMEOUT_MS: u64 = 10_000;
+
+fn v821_debug_enabled() -> bool {
+    cfg!(feature = "v821") && std::env::var_os("ZEROCLAW_V821_DEBUG").is_some()
+}
+
+fn v821_debug_stage(stage: &str) {
+    if v821_debug_enabled() {
+        eprintln!("[v821-debug][auth-profiles] {stage}");
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
@@ -164,8 +177,12 @@ impl AuthProfilesStore {
     }
 
     pub async fn load(&self) -> Result<AuthProfilesData> {
+        v821_debug_stage("load:start");
         let _lock = self.acquire_lock().await?;
-        self.load_locked().await
+        v821_debug_stage("load:lock_acquired");
+        let result = self.load_locked().await;
+        v821_debug_stage("load:done");
+        result
     }
 
     pub async fn upsert_profile(&self, mut profile: AuthProfile, set_active: bool) -> Result<()> {
@@ -247,7 +264,9 @@ impl AuthProfilesStore {
     }
 
     async fn load_locked(&self) -> Result<AuthProfilesData> {
+        v821_debug_stage("load_locked:start");
         let mut persisted = self.read_persisted_locked().await?;
+        v821_debug_stage("load_locked:read_persisted:done");
         let mut migrated = false;
 
         let mut profiles = BTreeMap::new();
@@ -313,9 +332,12 @@ impl AuthProfilesStore {
         }
 
         if migrated {
+            v821_debug_stage("load_locked:migration_write:start");
             self.write_persisted_locked(&persisted).await?;
+            v821_debug_stage("load_locked:migration_write:done");
         }
 
+        v821_debug_stage("load_locked:done");
         Ok(AuthProfilesData {
             schema_version: persisted.schema_version,
             updated_at: parse_datetime_with_fallback(&persisted.updated_at),
@@ -374,18 +396,25 @@ impl AuthProfilesStore {
     }
 
     async fn read_persisted_locked(&self) -> Result<PersistedAuthProfiles> {
-        if !self.path.exists() {
-            return Ok(PersistedAuthProfiles::default());
-        }
-
-        let bytes = fs::read(&self.path).await.with_context(|| {
-            format!(
-                "Failed to read auth profile store at {}",
-                self.path.display()
-            )
-        })?;
+        v821_debug_stage("read_persisted_locked:start");
+        let bytes = match read_bytes(&self.path).await {
+            Ok(bytes) => bytes,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                v821_debug_stage("read_persisted_locked:not_found");
+                return Ok(PersistedAuthProfiles::default());
+            }
+            Err(err) => {
+                return Err(err).with_context(|| {
+                    format!(
+                        "Failed to read auth profile store at {}",
+                        self.path.display()
+                    )
+                });
+            }
+        };
 
         if bytes.is_empty() {
+            v821_debug_stage("read_persisted_locked:empty");
             return Ok(PersistedAuthProfiles::default());
         }
 
@@ -409,12 +438,13 @@ impl AuthProfilesStore {
             );
         }
 
+        v821_debug_stage("read_persisted_locked:done");
         Ok(persisted)
     }
 
     async fn write_persisted_locked(&self, persisted: &PersistedAuthProfiles) -> Result<()> {
         if let Some(parent) = self.path.parent() {
-            fs::create_dir_all(parent).await.with_context(|| {
+            create_dir_all(parent).await.with_context(|| {
                 format!(
                     "Failed to create auth profile directory at {}",
                     parent.display()
@@ -432,14 +462,14 @@ impl AuthProfilesStore {
         );
         let tmp_path = self.path.with_file_name(tmp_name);
 
-        fs::write(&tmp_path, &json).await.with_context(|| {
+        write_bytes(&tmp_path, &json).await.with_context(|| {
             format!(
                 "Failed to write temporary auth profile file at {}",
                 tmp_path.display()
             )
         })?;
 
-        fs::rename(&tmp_path, &self.path).await.with_context(|| {
+        rename_path(&tmp_path, &self.path).await.with_context(|| {
             format!(
                 "Failed to replace auth profile store at {}",
                 self.path.display()
@@ -467,30 +497,36 @@ impl AuthProfilesStore {
     }
 
     async fn acquire_lock(&self) -> Result<AuthProfileLockGuard> {
+        v821_debug_stage("acquire_lock:start");
         if let Some(parent) = self.lock_path.parent() {
-            fs::create_dir_all(parent).await.with_context(|| {
-                format!("Failed to create lock directory at {}", parent.display())
-            })?;
+            #[cfg(feature = "v821")]
+            {
+                if !dir_can_be_read(parent) {
+                    anyhow::bail!("Lock directory is not accessible: {}", parent.display());
+                }
+            }
+
+            #[cfg(not(feature = "v821"))]
+            {
+                v821_debug_stage("acquire_lock:create_dir_all:start");
+                create_dir_all(parent).await.with_context(|| {
+                    format!("Failed to create lock directory at {}", parent.display())
+                })?;
+                v821_debug_stage("acquire_lock:create_dir_all:done");
+            }
         }
 
         let mut waited = 0_u64;
         loop {
-            match OpenOptions::new()
-                .create_new(true)
-                .write(true)
-                .open(&self.lock_path)
-                .await
-            {
+            v821_debug_stage("acquire_lock:open_lock_file:start");
+            match open_lock_file(&self.lock_path).await {
                 Ok(mut file) => {
+                    v821_debug_stage("acquire_lock:open_lock_file:done");
                     let mut buffer = Vec::new();
                     writeln!(&mut buffer, "pid={}", std::process::id())?;
-                    if let Err(e) = file.write_all(&buffer).await {
-                        fs::remove_file(&self.lock_path)
-                            .await
-                            .inspect(|e| {
-                                tracing::error!("Failed to remove auth profile lock file: {e:?}");
-                            })
-                            .ok();
+                    v821_debug_stage("acquire_lock:write_lock_contents:start");
+                    if let Err(e) = write_lock_contents(&mut file, &buffer).await {
+                        remove_file_if_exists(&self.lock_path).await;
                         return Err(e).with_context(|| {
                             format!(
                                 "Failed to write auth profile lock at {}",
@@ -498,6 +534,8 @@ impl AuthProfilesStore {
                             )
                         });
                     }
+                    v821_debug_stage("acquire_lock:write_lock_contents:done");
+                    v821_debug_stage("acquire_lock:done");
                     return Ok(AuthProfileLockGuard {
                         lock_path: self.lock_path.clone(),
                     });
@@ -531,8 +569,101 @@ struct AuthProfileLockGuard {
 
 impl Drop for AuthProfileLockGuard {
     fn drop(&mut self) {
-        let _ = std::fs::remove_file(&self.lock_path);
+        let _ = stdfs::remove_file(&self.lock_path);
     }
+}
+
+#[cfg(feature = "v821")]
+async fn create_dir_all(path: &Path) -> std::io::Result<()> {
+    stdfs::create_dir_all(path)
+}
+
+#[cfg(not(feature = "v821"))]
+async fn create_dir_all(path: &Path) -> std::io::Result<()> {
+    fs::create_dir_all(path).await
+}
+
+#[cfg(feature = "v821")]
+async fn read_bytes(path: &Path) -> std::io::Result<Vec<u8>> {
+    stdfs::read(path)
+}
+
+#[cfg(not(feature = "v821"))]
+async fn read_bytes(path: &Path) -> std::io::Result<Vec<u8>> {
+    fs::read(path).await
+}
+
+#[cfg(feature = "v821")]
+async fn write_bytes(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    stdfs::write(path, bytes)
+}
+
+#[cfg(not(feature = "v821"))]
+async fn write_bytes(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    fs::write(path, bytes).await
+}
+
+#[cfg(feature = "v821")]
+async fn rename_path(from: &Path, to: &Path) -> std::io::Result<()> {
+    stdfs::rename(from, to)
+}
+
+#[cfg(not(feature = "v821"))]
+async fn rename_path(from: &Path, to: &Path) -> std::io::Result<()> {
+    fs::rename(from, to).await
+}
+
+#[cfg(feature = "v821")]
+type LockFile = stdfs::File;
+
+#[cfg(not(feature = "v821"))]
+type LockFile = tokio::fs::File;
+
+#[cfg(feature = "v821")]
+async fn open_lock_file(path: &Path) -> std::io::Result<LockFile> {
+    stdfs::OpenOptions::new()
+        .create_new(true)
+        .write(true)
+        .open(path)
+}
+
+#[cfg(not(feature = "v821"))]
+async fn open_lock_file(path: &Path) -> std::io::Result<LockFile> {
+    OpenOptions::new()
+        .create_new(true)
+        .write(true)
+        .open(path)
+        .await
+}
+
+#[cfg(feature = "v821")]
+async fn write_lock_contents(file: &mut LockFile, buffer: &[u8]) -> std::io::Result<()> {
+    std::io::Write::write_all(file, buffer)
+}
+
+#[cfg(not(feature = "v821"))]
+async fn write_lock_contents(file: &mut LockFile, buffer: &[u8]) -> std::io::Result<()> {
+    file.write_all(buffer).await
+}
+
+async fn remove_file_if_exists(path: &Path) {
+    #[cfg(feature = "v821")]
+    if let Err(e) = stdfs::remove_file(path) {
+        if e.kind() != std::io::ErrorKind::NotFound {
+            tracing::error!("Failed to remove auth profile lock file: {e:?}");
+        }
+    }
+
+    #[cfg(not(feature = "v821"))]
+    if let Err(e) = fs::remove_file(path).await {
+        if e.kind() != std::io::ErrorKind::NotFound {
+            tracing::error!("Failed to remove auth profile lock file: {e:?}");
+        }
+    }
+}
+
+fn dir_can_be_read(path: &Path) -> bool {
+    stdfs::read_dir(path).is_ok()
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

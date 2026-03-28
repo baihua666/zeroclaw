@@ -38,6 +38,12 @@ use anyhow::Context;
 use std::path::Path;
 use std::sync::Arc;
 
+fn v821_memory_debug(stage: &str) {
+    if cfg!(feature = "v821") && std::env::var_os("ZEROCLAW_V821_DEBUG").is_some() {
+        eprintln!("[v821-memory] {stage}");
+    }
+}
+
 fn create_memory_with_builders<F, G>(
     backend_name: &str,
     workspace_dir: &Path,
@@ -218,13 +224,27 @@ pub fn create_memory_with_storage_and_routes(
     workspace_dir: &Path,
     api_key: Option<&str>,
 ) -> anyhow::Result<Box<dyn Memory>> {
+    v821_memory_debug("factory:start");
     let backend_name = effective_memory_backend_name(&config.backend, storage_provider);
     let backend_kind = classify_memory_backend(&backend_name);
+    v821_memory_debug("factory:backend_classified");
     let resolved_embedding = resolve_embedding_config(config, embedding_routes, api_key);
+    v821_memory_debug("factory:embedding_resolved");
 
     // Best-effort memory hygiene/retention pass (throttled by state file).
-    if let Err(e) = hygiene::run_if_due(config, workspace_dir) {
-        tracing::warn!("memory hygiene skipped: {e}");
+    #[cfg(feature = "v821")]
+    {
+        // V821 startup has proven unstable across multiple std/fs-heavy hygiene probes.
+        // Skip this non-critical maintenance pass so gateway boot is not blocked.
+        v821_memory_debug("factory:hygiene:skipped:v821");
+    }
+    #[cfg(not(feature = "v821"))]
+    {
+        v821_memory_debug("factory:hygiene:start");
+        if let Err(e) = hygiene::run_if_due(config, workspace_dir) {
+            tracing::warn!("memory hygiene skipped: {e}");
+        }
+        v821_memory_debug("factory:hygiene:done");
     }
 
     // If snapshot_on_hygiene is enabled, export core memories during hygiene.
@@ -235,30 +255,52 @@ pub fn create_memory_with_storage_and_routes(
             MemoryBackendKind::Sqlite | MemoryBackendKind::Lucid
         )
     {
+        v821_memory_debug("factory:snapshot_export:start");
         if let Err(e) = snapshot::export_snapshot(workspace_dir) {
             tracing::warn!("memory snapshot skipped: {e}");
         }
+        v821_memory_debug("factory:snapshot_export:done");
     }
 
     // Auto-hydration: if brain.db is missing but MEMORY_SNAPSHOT.md exists,
     // restore the "soul" from the snapshot before creating the backend.
-    if config.auto_hydrate
-        && matches!(
-            backend_kind,
-            MemoryBackendKind::Sqlite | MemoryBackendKind::Lucid
-        )
-        && snapshot::should_hydrate(workspace_dir)
+    #[cfg(feature = "v821")]
     {
-        tracing::info!("🧬 Cold boot detected — hydrating from MEMORY_SNAPSHOT.md");
-        match snapshot::hydrate_from_snapshot(workspace_dir) {
-            Ok(count) => {
-                if count > 0 {
-                    tracing::info!("🧬 Hydrated {count} core memories from snapshot");
+        if config.auto_hydrate
+            && matches!(
+                backend_kind,
+                MemoryBackendKind::Sqlite | MemoryBackendKind::Lucid
+            )
+        {
+            // Auto-hydration is a cold-boot convenience path. On V821, startup has
+            // repeatedly proven unstable around filesystem existence/metadata probes.
+            // Skip it so daemon boot is not blocked on snapshot inspection.
+            v821_memory_debug("factory:hydrate:skipped:v821");
+        }
+    }
+
+    #[cfg(not(feature = "v821"))]
+    {
+        if config.auto_hydrate
+            && matches!(
+                backend_kind,
+                MemoryBackendKind::Sqlite | MemoryBackendKind::Lucid
+            )
+            && snapshot::should_hydrate(workspace_dir)
+        {
+            v821_memory_debug("factory:hydrate:start");
+            tracing::info!("🧬 Cold boot detected — hydrating from MEMORY_SNAPSHOT.md");
+            match snapshot::hydrate_from_snapshot(workspace_dir) {
+                Ok(count) => {
+                    if count > 0 {
+                        tracing::info!("🧬 Hydrated {count} core memories from snapshot");
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!("memory hydration failed: {e}");
                 }
             }
-            Err(e) => {
-                tracing::warn!("memory hydration failed: {e}");
-            }
+            v821_memory_debug("factory:hydrate:done");
         }
     }
 
@@ -321,6 +363,7 @@ pub fn create_memory_with_storage_and_routes(
     }
 
     if matches!(backend_kind, MemoryBackendKind::Qdrant) {
+        v821_memory_debug("factory:qdrant:start");
         let url = config
             .qdrant
             .url
@@ -361,6 +404,7 @@ pub fn create_memory_with_storage_and_routes(
         )));
     }
 
+    v821_memory_debug("factory:backend_build:start");
     create_memory_with_builders(
         &backend_name,
         workspace_dir,

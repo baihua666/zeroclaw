@@ -9,6 +9,24 @@ const SCHEDULER_STALE_SECONDS: i64 = 120;
 const CHANNEL_STALE_SECONDS: i64 = 300;
 const COMMAND_VERSION_PREVIEW_CHARS: usize = 60;
 
+fn v821_debug_enabled() -> bool {
+    cfg!(feature = "v821") && std::env::var_os("ZEROCLAW_V821_DEBUG").is_some()
+}
+
+fn v821_debug_stage(stage: &str) {
+    if v821_debug_enabled() {
+        eprintln!("[v821-debug][doctor] {stage}");
+    }
+}
+
+fn file_can_be_opened(path: &Path) -> bool {
+    std::fs::OpenOptions::new().read(true).open(path).is_ok()
+}
+
+fn dir_can_be_read(path: &Path) -> bool {
+    std::fs::read_dir(path).is_ok()
+}
+
 // ── Diagnostic item ──────────────────────────────────────────────
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
@@ -79,20 +97,33 @@ impl DiagItem {
 pub fn diagnose(config: &Config) -> Vec<DiagResult> {
     let mut items: Vec<DiagItem> = Vec::new();
 
+    v821_debug_stage("diagnose:check_config_semantics:start");
     check_config_semantics(config, &mut items);
+    v821_debug_stage("diagnose:check_config_semantics:done");
+    v821_debug_stage("diagnose:check_workspace:start");
     check_workspace(config, &mut items);
+    v821_debug_stage("diagnose:check_workspace:done");
+    v821_debug_stage("diagnose:check_daemon_state:start");
     check_daemon_state(config, &mut items);
+    v821_debug_stage("diagnose:check_daemon_state:done");
+    v821_debug_stage("diagnose:check_environment:start");
     check_environment(&mut items);
+    v821_debug_stage("diagnose:check_environment:done");
+    v821_debug_stage("diagnose:check_cli_tools:start");
     check_cli_tools(&mut items);
+    v821_debug_stage("diagnose:check_cli_tools:done");
 
     items.into_iter().map(DiagItem::into_result).collect()
 }
 
 /// Run diagnostics and print human-readable report to stdout.
 pub fn run(config: &Config) -> Result<()> {
+    v821_debug_stage("run:start");
     let results = diagnose(config);
+    v821_debug_stage("run:diagnose:done");
 
     // Print report
+    v821_debug_stage("run:print:start");
     println!("🩺 ZeroClaw Doctor (enhanced)");
     println!();
 
@@ -130,6 +161,7 @@ pub fn run(config: &Config) -> Result<()> {
         println!("  💡 Fix the errors above, then run `zeroclaw doctor` again.");
     }
 
+    v821_debug_stage("run:done");
     Ok(())
 }
 
@@ -420,7 +452,8 @@ fn check_config_semantics(config: &Config, items: &mut Vec<DiagItem>) {
     let cat = "config";
 
     // Config file exists
-    if config.config_path.exists() {
+    v821_debug_stage("check_config_semantics:config_path_exists:start");
+    if file_can_be_opened(&config.config_path) {
         items.push(DiagItem::ok(
             cat,
             format!("config file: {}", config.config_path.display()),
@@ -431,8 +464,10 @@ fn check_config_semantics(config: &Config, items: &mut Vec<DiagItem>) {
             format!("config file not found: {}", config.config_path.display()),
         ));
     }
+    v821_debug_stage("check_config_semantics:config_path_exists:done");
 
     // Provider validity
+    v821_debug_stage("check_config_semantics:default_provider:start");
     if let Some(ref provider) = config.default_provider {
         if let Some(reason) = provider_validation_error(provider) {
             items.push(DiagItem::error(
@@ -448,8 +483,10 @@ fn check_config_semantics(config: &Config, items: &mut Vec<DiagItem>) {
     } else {
         items.push(DiagItem::error(cat, "no default_provider configured"));
     }
+    v821_debug_stage("check_config_semantics:default_provider:done");
 
     // API key presence
+    v821_debug_stage("check_config_semantics:api_key:start");
     if config.default_provider.as_deref() != Some("ollama") {
         if config.api_key.is_some() {
             items.push(DiagItem::ok(cat, "API key configured"));
@@ -460,8 +497,10 @@ fn check_config_semantics(config: &Config, items: &mut Vec<DiagItem>) {
             ));
         }
     }
+    v821_debug_stage("check_config_semantics:api_key:done");
 
     // Model configured
+    v821_debug_stage("check_config_semantics:default_model:start");
     if config.default_model.is_some() {
         items.push(DiagItem::ok(
             cat,
@@ -473,8 +512,10 @@ fn check_config_semantics(config: &Config, items: &mut Vec<DiagItem>) {
     } else {
         items.push(DiagItem::warn(cat, "no default_model configured"));
     }
+    v821_debug_stage("check_config_semantics:default_model:done");
 
     // Temperature range
+    v821_debug_stage("check_config_semantics:temperature:start");
     if config.default_temperature >= 0.0 && config.default_temperature <= 2.0 {
         items.push(DiagItem::ok(
             cat,
@@ -492,16 +533,20 @@ fn check_config_semantics(config: &Config, items: &mut Vec<DiagItem>) {
             ),
         ));
     }
+    v821_debug_stage("check_config_semantics:temperature:done");
 
     // Gateway port range
+    v821_debug_stage("check_config_semantics:gateway_port:start");
     let port = config.gateway.port;
     if port > 0 {
         items.push(DiagItem::ok(cat, format!("gateway port: {port}")));
     } else {
         items.push(DiagItem::error(cat, "gateway port is 0 (invalid)"));
     }
+    v821_debug_stage("check_config_semantics:gateway_port:done");
 
     // Reliability: fallback providers
+    v821_debug_stage("check_config_semantics:fallback_providers:start");
     for fb in &config.reliability.fallback_providers {
         if let Some(reason) = provider_validation_error(fb) {
             items.push(DiagItem::warn(
@@ -510,8 +555,10 @@ fn check_config_semantics(config: &Config, items: &mut Vec<DiagItem>) {
             ));
         }
     }
+    v821_debug_stage("check_config_semantics:fallback_providers:done");
 
     // Model routes validation
+    v821_debug_stage("check_config_semantics:model_routes:start");
     for route in &config.model_routes {
         if route.hint.is_empty() {
             items.push(DiagItem::warn(cat, "model route with empty hint"));
@@ -532,8 +579,10 @@ fn check_config_semantics(config: &Config, items: &mut Vec<DiagItem>) {
             ));
         }
     }
+    v821_debug_stage("check_config_semantics:model_routes:done");
 
     // Embedding routes validation
+    v821_debug_stage("check_config_semantics:embedding_routes:start");
     for route in &config.embedding_routes {
         if route.hint.trim().is_empty() {
             items.push(DiagItem::warn(cat, "embedding route with empty hint"));
@@ -563,7 +612,9 @@ fn check_config_semantics(config: &Config, items: &mut Vec<DiagItem>) {
             ));
         }
     }
+    v821_debug_stage("check_config_semantics:embedding_routes:done");
 
+    v821_debug_stage("check_config_semantics:embedding_hint:start");
     if let Some(hint) = config
         .memory
         .embedding_model
@@ -584,8 +635,10 @@ fn check_config_semantics(config: &Config, items: &mut Vec<DiagItem>) {
             ));
         }
     }
+    v821_debug_stage("check_config_semantics:embedding_hint:done");
 
     // Channel: at least one configured
+    v821_debug_stage("check_config_semantics:channels:start");
     let cc = &config.channels_config;
     let has_channel = cc.channels().iter().any(|(_, ok)| *ok);
 
@@ -597,8 +650,10 @@ fn check_config_semantics(config: &Config, items: &mut Vec<DiagItem>) {
             "no channels configured — run `zeroclaw onboard` to set one up",
         ));
     }
+    v821_debug_stage("check_config_semantics:channels:done");
 
     // Delegate agents: provider validity
+    v821_debug_stage("check_config_semantics:agents:start");
     let mut agent_names: Vec<_> = config.agents.keys().collect();
     agent_names.sort();
     for name in agent_names {
@@ -613,6 +668,7 @@ fn check_config_semantics(config: &Config, items: &mut Vec<DiagItem>) {
             ));
         }
     }
+    v821_debug_stage("check_config_semantics:agents:done");
 }
 
 fn provider_validation_error(name: &str) -> Option<String> {
@@ -659,7 +715,7 @@ fn check_workspace(config: &Config, items: &mut Vec<DiagItem>) {
     let cat = "workspace";
     let ws = &config.workspace_dir;
 
-    if ws.exists() {
+    if dir_can_be_read(ws) {
         items.push(DiagItem::ok(
             cat,
             format!("directory exists: {}", ws.display()),
@@ -727,7 +783,7 @@ fn check_file_exists(
     items: &mut Vec<DiagItem>,
 ) {
     let path = base.join(name);
-    if path.is_file() {
+    if file_can_be_opened(&path) {
         items.push(DiagItem::ok(cat, format!("{name} present")));
     } else if required {
         items.push(DiagItem::error(cat, format!("{name} missing")));
@@ -772,19 +828,18 @@ fn check_daemon_state(config: &Config, items: &mut Vec<DiagItem>) {
     let cat = "daemon";
     let state_file = crate::daemon::state_file_path(config);
 
-    if !state_file.exists() {
-        items.push(DiagItem::error(
-            cat,
-            format!(
-                "state file not found: {} — is the daemon running?",
-                state_file.display()
-            ),
-        ));
-        return;
-    }
-
     let raw = match std::fs::read_to_string(&state_file) {
         Ok(r) => r,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            items.push(DiagItem::error(
+                cat,
+                format!(
+                    "state file not found: {} — is the daemon running?",
+                    state_file.display()
+                ),
+            ));
+            return;
+        }
         Err(e) => {
             items.push(DiagItem::error(cat, format!("cannot read state file: {e}")));
             return;
