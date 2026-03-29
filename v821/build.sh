@@ -69,8 +69,8 @@ setup_cargo_env() {
     export CFLAGS_target_riscv32gc_unknown_linux_musl="-march=rv32imfdcxandes -mabi=ilp32d -mcmodel=medany -D__riscv32__"
     export CXXFLAGS_target_riscv32gc_unknown_linux_musl="-march=rv32imfdcxandes -mabi=ilp32d -mcmodel=medany -D__riscv32__"
 
-    # V821 平台 TLS 栈不可用（aws-lc-rs 握手挂住，OpenSSL 空指针崩溃），
-    # HTTPS 通过云服务器 relay (HTTP→HTTPS) 中转，二进制本身不需要 TLS。
+    # V821 TLS 栈 (rustls + aws-lc-rs) 在系统时间正确时完全可用，HTTPS 直连。
+    # 注意: V821 无 RTC 电池，启动前需同步时间（run-daemon.sh 已自动处理）。
 }
 
 clean_build() {

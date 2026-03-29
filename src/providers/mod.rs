@@ -1433,12 +1433,13 @@ fn create_provider_with_url_and_options(
                 "Custom provider",
                 "custom:https://your-api.com",
             )?;
-            Ok(compat(OpenAiCompatibleProvider::new_with_vision(
+            // Custom endpoints typically don't support the OpenAI Responses API,
+            // so skip the /v1/responses fallback to avoid 405 errors.
+            Ok(compat(OpenAiCompatibleProvider::new_no_responses_fallback(
                 "Custom",
                 &base_url,
                 key,
                 AuthStyle::Bearer,
-                true,
             )))
         }
 

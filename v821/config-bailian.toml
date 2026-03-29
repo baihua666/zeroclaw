@@ -1,17 +1,15 @@
-# V821 设备端配置 — 阿里百练 (通过 relay 中转)
+# V821 设备端配置 — 阿里百练 (HTTPS 直连)
 #
 # 使用方式:
-#   1. 在 Mac/PC 上启动 relay:
-#      DASHSCOPE_API_KEY=sk-xxx ./v821/run-bailian-relay.sh
-#   2. 修改下方 RELAY_HOST_IP 为 Mac/PC 的局域网 IP
-#   3. 推送到设备:
+#   1. 推送到设备:
+#      adb push v821/config-bailian.toml /mnt/UDISK/config-bailian.toml
 #      adb shell 'cp /mnt/UDISK/config-bailian.toml /tmp/zc_test_run/config.toml'
-#   4. 启动 daemon:
-#      ./v821/run-daemon.sh --lan --debug
-
-# V821 平台 TLS 不可用，通过云服务器 relay 中转 (HTTP→HTTPS)
-# relay: 120.24.23.161:19091 (bailian-relay.js, systemd 常驻)
-default_provider = "custom:http://120.24.23.161:19091/v1"
+#   2. 启动 daemon（脚本会自动同步时间）:
+#      DASHSCOPE_API_KEY=sk-xxx ./v821/run-daemon.sh --lan --bailian
+#
+# 注意: V821 无 RTC 电池，TLS 证书验证依赖正确的系统时间。
+#       run-daemon.sh 会自动同步宿主机时间到设备。
+default_provider = "custom:https://coding.dashscope.aliyuncs.com/v1"
 default_model = "qwen3-coder-next"
 default_temperature = 0.7
 provider_timeout_secs = 120
