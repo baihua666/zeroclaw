@@ -251,15 +251,22 @@ impl Channel for QQChannel {
     async fn send(&self, message: &SendMessage) -> anyhow::Result<()> {
         let token = self.get_token().await?;
 
+        // thread_ts carries the original QQ msg_id for passive replies
+        let msg_id = message.thread_ts.as_deref().unwrap_or("");
+
         // Determine if this is a group or private message based on recipient format
         // Format: "user:{openid}" or "group:{group_openid}"
         let (url, body) = if let Some(group_id) = message.recipient.strip_prefix("group:") {
+            let mut body = json!({
+                "content": &message.content,
+                "msg_type": 0,
+            });
+            if !msg_id.is_empty() {
+                body["msg_id"] = json!(msg_id);
+            }
             (
                 format!("{QQ_API_BASE}/v2/groups/{group_id}/messages"),
-                json!({
-                    "content": &message.content,
-                    "msg_type": 0,
-                }),
+                body,
             )
         } else {
             let raw_uid = message
@@ -270,12 +277,16 @@ impl Channel for QQChannel {
                 .chars()
                 .filter(|c| c.is_alphanumeric() || *c == '_')
                 .collect();
+            let mut body = json!({
+                "content": &message.content,
+                "msg_type": 0,
+            });
+            if !msg_id.is_empty() {
+                body["msg_id"] = json!(msg_id);
+            }
             (
                 format!("{QQ_API_BASE}/v2/users/{user_id}/messages"),
-                json!({
-                    "content": &message.content,
-                    "msg_type": 0,
-                }),
+                body,
             )
         };
 
@@ -450,6 +461,7 @@ impl Channel for QQChannel {
 
                             let chat_id = format!("user:{user_openid}");
 
+                            // Pass QQ msg_id via thread_ts for passive reply (required by QQ API v2)
                             let channel_msg = ChannelMessage {
                                 id: Uuid::new_v4().to_string(),
                                 sender: user_openid.to_string(),
@@ -460,7 +472,7 @@ impl Channel for QQChannel {
                                     .duration_since(std::time::UNIX_EPOCH)
                                     .unwrap_or_default()
                                     .as_secs(),
-                                thread_ts: None,
+                                thread_ts: if msg_id.is_empty() { None } else { Some(msg_id.to_string()) },
                             };
 
                             if tx.send(channel_msg).await.is_err() {
@@ -488,6 +500,7 @@ impl Channel for QQChannel {
                             let group_openid = d.get("group_openid").and_then(|g| g.as_str()).unwrap_or("unknown");
                             let chat_id = format!("group:{group_openid}");
 
+                            // Pass QQ msg_id via thread_ts for passive reply (required by QQ API v2)
                             let channel_msg = ChannelMessage {
                                 id: Uuid::new_v4().to_string(),
                                 sender: author_id.to_string(),
@@ -498,7 +511,7 @@ impl Channel for QQChannel {
                                     .duration_since(std::time::UNIX_EPOCH)
                                     .unwrap_or_default()
                                     .as_secs(),
-                                thread_ts: None,
+                                thread_ts: if msg_id.is_empty() { None } else { Some(msg_id.to_string()) },
                             };
 
                             if tx.send(channel_msg).await.is_err() {

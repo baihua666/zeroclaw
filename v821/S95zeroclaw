@@ -1,0 +1,56 @@
+#!/bin/sh
+# ZeroClaw V821 开机自启 init 脚本
+# 部署到设备 /etc/init.d/S95zeroclaw
+#
+# 在 S50wifidaemon 之后执行，启动 zeroclaw daemon
+# rc.final 通过 `. $i` (source) 执行 .sh 脚本，通过 fork 执行非 .sh 脚本
+# 本脚本无 .sh 后缀，由 rc.final fork 子进程执行
+
+SCRIPT="/mnt/UDISK/start_zeroclaw.sh"
+LOG="/tmp/zeroclaw_v821_daemon.log"
+
+start() {
+    [ -x "$SCRIPT" ] || return 0
+
+    echo "Starting ZeroClaw..."
+    # V821 BusyBox 无 setsid/nohup，用 double-fork 脱离调用者进程组:
+    # 外层 subshell fork 后退出，内层进程变为孤儿，由 init(PID 1) 接管
+    ( sh "$SCRIPT" >"$LOG" 2>&1 </dev/null & )
+}
+
+stop() {
+    echo "Stopping ZeroClaw..."
+    killall zeroclaw 2>/dev/null
+}
+
+status() {
+    if ps | grep -v grep | grep -q '/mnt/UDISK/zeroclaw'; then
+        echo "ZeroClaw is running"
+        ps | grep '/mnt/UDISK/zeroclaw' | grep -v grep
+    else
+        echo "ZeroClaw is not running"
+    fi
+}
+
+case "$1" in
+    start)
+        start
+        ;;
+    stop)
+        stop
+        ;;
+    restart)
+        stop
+        sleep 2
+        start
+        ;;
+    status)
+        status
+        ;;
+    *)
+        echo "Usage: $0 {start|stop|restart|status}"
+        exit 1
+        ;;
+esac
+
+exit 0

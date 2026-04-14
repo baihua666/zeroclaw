@@ -91,9 +91,9 @@ cd /home/tubao/code/zeroclaw
 target/riscv32gc-unknown-linux-musl/release-v821/zeroclaw
 ```
 
-- 约 14.5MB，ELF 32-bit RISC-V，静态链接（musl）
+- 约 14.8MB，ELF 32-bit RISC-V，动态链接（musl）
 - Profile: `release-v821`（thin LTO, opt-level=z, codegen-units=1）
-- Feature: `v821`（禁用 prometheus、websocket、ring；启用 aws-lc-rs）
+- Feature: `v821`（禁用 prometheus、ring；启用 aws-lc-rs + channels-websocket）
 
 ### 编译原理
 
@@ -118,72 +118,68 @@ target/riscv32gc-unknown-linux-musl/release-v821/zeroclaw
 
 ## 发布到全新 V821 设备
 
-### 步骤 1：下载编译产物到本地
+### 一键部署（推荐）
 
 ```bash
-scp root@120.24.23.161:/home/tubao/code/zeroclaw/target/riscv32gc-unknown-linux-musl/release-v821/zeroclaw /tmp/zeroclaw_v821
+# 从编译服务器下载二进制并部署（已有编译产物）
+./v821/setup-device.sh --api-key sk-sp-xxx
+
+# 先编译再部署（约 20 分钟）
+./v821/setup-device.sh --api-key sk-sp-xxx --build
+
+# 使用本地已下载的二进制
+./v821/setup-device.sh --api-key sk-sp-xxx --binary /tmp/zeroclaw_v821
 ```
 
-### 步骤 2：连接设备并推送文件
+脚本自动完成 7 个步骤：ADB 检查 → 获取二进制 → 清理设备 → 部署文件（5 项） → 同步时间 → 启动 daemon → 验证（进程/QQ/Gateway/signal 11）。
+
+### 手动部署（逐步）
+
+<details>
+<summary>展开手动步骤</summary>
 
 ```bash
-# 确认设备已连接
-adb devices
+# 1. 下载编译产物
+scp root@120.24.23.161:/home/tubao/code/zeroclaw/target/riscv32gc-unknown-linux-musl/release-v821/zeroclaw /tmp/zeroclaw_v821
 
-# 推送二进制
+# 2. 推送二进制
 adb push /tmp/zeroclaw_v821 /mnt/UDISK/zeroclaw
 adb shell 'chmod +x /mnt/UDISK/zeroclaw'
 
-# 推送配置模板
+# 3. 推送配置和脚本
 adb push v821/config-bailian.toml /mnt/UDISK/config-bailian.toml
+adb push v821/start_zeroclaw.sh /mnt/UDISK/start_zeroclaw.sh
+adb shell 'chmod 755 /mnt/UDISK/start_zeroclaw.sh'
 
-# 推送启动脚本
-adb shell 'cat > /mnt/UDISK/start_zeroclaw.sh << "SCRIPT"
-#!/bin/sh
-# ZeroClaw V821 一键启动脚本
-export ZEROCLAW_V821_DEBUG=1
-export ZEROCLAW_ALLOW_PUBLIC_BIND=true
-export QWEN_OAUTH_RESOURCE_URL=coding.dashscope.aliyuncs.com
+# 4. 写入 API key
+echo 'export DASHSCOPE_API_KEY="sk-sp-xxx"
 export ZEROCLAW_PROVIDER="qwen-code"
 export ZEROCLAW_MODEL="qwen3-coder-next"
-export DASHSCOPE_API_KEY="sk-sp-85875c80488f42b08302e62f02b688b6"
+export QWEN_OAUTH_RESOURCE_URL="coding.dashscope.aliyuncs.com"' > /tmp/zc.env
+adb push /tmp/zc.env /mnt/UDISK/zeroclaw.env
 
-CONFIG_DIR="${1:-/tmp/zc_run}"
-PORT="${2:-9091}"
+# 5. 部署开机自启
+adb push v821/S95zeroclaw /etc/init.d/S95zeroclaw
+adb shell 'chmod 755 /etc/init.d/S95zeroclaw'
 
-killall zeroclaw 2>/dev/null
-sleep 1
-
-mkdir -p "$CONFIG_DIR"
-if [ ! -f "$CONFIG_DIR/config.toml" ]; then
-    cp /mnt/UDISK/config-bailian.toml "$CONFIG_DIR/config.toml"
-fi
-
-exec /mnt/UDISK/zeroclaw --config-dir "$CONFIG_DIR" daemon --host 0.0.0.0 --port "$PORT"
-SCRIPT
-chmod +x /mnt/UDISK/start_zeroclaw.sh'
-```
-
-### 步骤 3：同步时间并验证
-
-```bash
-# 同步时间（TLS 证书验证必须）
+# 6. 同步时间
 adb shell "date -u -s '$(date -u '+%Y-%m-%d %H:%M:%S')'"
 
-# 快速验证二进制
+# 7. 验证
 adb shell '/mnt/UDISK/zeroclaw --help'
-
-# 验证 HTTPS 直连（可选）
-adb shell 'wget -q -O - https://httpbin.org/get 2>&1 | head -5'
 ```
+
+</details>
 
 ### 设备端文件清单
 
 | 路径 | 大小 | 说明 |
 |------|------|------|
-| `/mnt/UDISK/zeroclaw` | ~14.5MB | 主二进制 |
-| `/mnt/UDISK/start_zeroclaw.sh` | ~0.5KB | 一键启动脚本 |
-| `/mnt/UDISK/config-bailian.toml` | ~2.5KB | 百练配置模板 |
+| `/mnt/UDISK/zeroclaw` | ~14.8MB | 主二进制 |
+| `/mnt/UDISK/config-bailian.toml` | ~2.1KB | 配置模板（含 QQ 通道、session_persistence=false） |
+| `/mnt/UDISK/zeroclaw.env` | ~0.2KB | 环境变量（API key、provider 参数） |
+| `/mnt/UDISK/start_zeroclaw.sh` | ~2.9KB | 设备端启动脚本（WiFi + NTP + daemon） |
+| `/etc/init.d/S95zeroclaw` | ~1.3KB | 开机自启 init 脚本 |
 
 ---
 
@@ -348,8 +344,12 @@ API Key:  sk-sp-85875c80488f42b08302e62f02b688b6
 
 | 脚本 | 用途 |
 |------|------|
+| `setup-device.sh` | **全新设备一键部署**（推荐入口，含编译/下载/部署/验证） |
 | `build.sh` | V821 交叉编译（含 Web Dashboard） |
 | `deploy.sh` | 停旧进程 + adb push 新二进制 |
+| `deploy-autostart.sh` | 部署启动脚本 + init.d 自启到设备 |
 | `run-daemon.sh` | 本地启动设备 daemon（支持 --lan / --bailian / --debug） |
+| `start_zeroclaw.sh` | 设备端启动脚本（WiFi 等待 + NTP 时间同步 + daemon） |
+| `S95zeroclaw` | 设备 init.d 开机自启脚本 |
 | `common.sh` | 共享配置和辅助函数 |
-| `config-bailian.toml` | 设备端配置模板 |
+| `config-bailian.toml` | 设备端配置模板（含 QQ 通道 + session_persistence=false） |

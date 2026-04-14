@@ -221,9 +221,9 @@ tokio-rustls = { version = "0.26.4", default-features = false, features = ["aws-
 default = ["observability-prometheus", "channel-nostr", "ring"]
 
 # V821 feature: for Allwinner V821 (RISC-V 32-bit, Tina Linux)
-# Uses aws-lc-rs for non-TLS crypto. HTTPS handled via cloud relay (HTTP→HTTPS)
-# because both aws-lc-rs and OpenSSL TLS handshakes fail on rv32.
-v821 = ["dep:aws-lc-rs"]
+# Uses aws-lc-rs for crypto + TLS (rustls). V821 无 RTC 电池，启动前需同步时间。
+# channels-websocket 启用 QQ 等 WebSocket 通道。
+v821 = ["dep:aws-lc-rs", "channels-websocket"]
 
 # Ring feature: enables ring-based crypto and TLS (default, not available on RISC-V 32-bit)
 # Note: rustls and tokio-rustls are now always present but configured to use aws-lc-rs
@@ -231,7 +231,8 @@ v821 = ["dep:aws-lc-rs"]
 ring = ["dep:ring", "dep:rustls-platform-verifier", "dep:tokio-tungstenite", "dep:lettre", "channels-websocket"]
 
 # channels-websocket: enables WebSocket-based channels (QQ, Slack, Discord, DingTalk, Lark)
-channels-websocket = ["dep:tokio-tungstenite"]
+# rustls-tls-webpki-roots provides TLS for wss:// connections (uses project-level rustls with aws-lc-rs)
+channels-websocket = ["dep:tokio-tungstenite", "tokio-tungstenite/rustls-tls-webpki-roots"]
 
 channel-nostr = ["dep:nostr-sdk"]
 hardware = ["nusb", "tokio-serial"]

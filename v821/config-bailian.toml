@@ -1,22 +1,8 @@
-# V821 设备端配置 — 阿里百练 (HTTPS 直连)
-#
-# 使用方式:
-#   1. 推送到设备:
-#      adb push v821/config-bailian.toml /mnt/UDISK/config-bailian.toml
-#      adb shell 'cp /mnt/UDISK/config-bailian.toml /tmp/zc_test_run/config.toml'
-#   2. 启动 daemon（脚本会自动同步时间）:
-#      DASHSCOPE_API_KEY=sk-xxx ./v821/run-daemon.sh --lan --bailian
-#
-# 注意: V821 无 RTC 电池，TLS 证书验证依赖正确的系统时间。
-#       run-daemon.sh 会自动同步宿主机时间到设备。
-default_provider = "custom:https://coding.dashscope.aliyuncs.com/v1"
+# V821 设备端配置 — 阿里百练 (qwen-code provider)
+default_provider = "qwen-code"
 default_model = "qwen3-coder-next"
 default_temperature = 0.7
 provider_timeout_secs = 120
-
-[model_providers]
-
-[extra_headers]
 
 [observability]
 backend = "none"
@@ -90,6 +76,13 @@ max_run_history = 50
 [channels_config]
 cli = true
 message_timeout_secs = 300
+# V821: 禁用 session 持久化，避免文件系统操作导致 signal 11
+session_persistence = false
+
+[channels_config.qq]
+app_id = "1903829956"
+app_secret = "Sdo0DQet8OevDVo8Sn8UrEc1QqHiAc5Z"
+allowed_users = ["*"]
 
 [memory]
 backend = "sqlite"
@@ -104,7 +97,7 @@ provider = "none"
 [gateway]
 port = 9091
 host = "0.0.0.0"
-require_pairing = true
+require_pairing = false
 allow_public_bind = true
 
 [secrets]

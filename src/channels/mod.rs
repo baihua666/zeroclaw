@@ -757,13 +757,12 @@ fn runtime_defaults_snapshot(ctx: &ChannelRuntimeContext) -> ChannelRuntimeDefau
     }
 }
 
-async fn config_file_stamp(path: &Path) -> Option<ConfigFileStamp> {
-    let metadata = tokio::fs::metadata(path).await.ok()?;
-    let modified = metadata.modified().ok()?;
-    Some(ConfigFileStamp {
-        modified,
-        len: metadata.len(),
-    })
+async fn config_file_stamp(_path: &Path) -> Option<ConfigFileStamp> {
+    // V821: skip runtime config reload entirely.
+    // The previous impl returned current time, which always differed from the initial stamp,
+    // causing every message to trigger a full config reload + provider warmup (HTTPS).
+    // That reload path crashes on V821 (signal 11 at 0x00000000).
+    None
 }
 
 fn decrypt_optional_secret_for_runtime_reload(
@@ -784,8 +783,8 @@ fn decrypt_optional_secret_for_runtime_reload(
 }
 
 async fn load_runtime_defaults_from_config_file(path: &Path) -> Result<ChannelRuntimeDefaults> {
-    let contents = tokio::fs::read_to_string(path)
-        .await
+    // Use std::fs instead of tokio::fs on V821 RISC-V 32-bit due to compatibility issues
+    let contents = std::fs::read_to_string(path)
         .with_context(|| format!("Failed to read {}", path.display()))?;
     let mut parsed: Config =
         toml::from_str(&contents).with_context(|| format!("Failed to parse {}", path.display()))?;
@@ -852,7 +851,10 @@ async fn maybe_apply_runtime_config_update(ctx: &ChannelRuntimeContext) -> Resul
     )?;
     let next_default_provider: Arc<dyn Provider> = Arc::from(next_default_provider);
 
-    if let Err(err) = next_default_provider.warmup().await {
+    let skip_warmup = std::env::var("ZEROCLAW_SKIP_PROVIDER_WARMUP").as_deref() == Ok("1");
+    if skip_warmup {
+        tracing::info!("Skipping provider warmup (ZEROCLAW_SKIP_PROVIDER_WARMUP=1)");
+    } else if let Err(err) = next_default_provider.warmup().await {
         tracing::warn!(
             provider = %next_defaults.default_provider,
             "Provider warmup failed after config reload: {err}"
@@ -1137,7 +1139,10 @@ async fn get_or_create_provider(
     .await?;
     let provider: Arc<dyn Provider> = Arc::from(provider);
 
-    if let Err(err) = provider.warmup().await {
+    let skip_warmup = std::env::var("ZEROCLAW_SKIP_PROVIDER_WARMUP").as_deref() == Ok("1");
+    if skip_warmup {
+        tracing::info!("Skipping provider warmup (ZEROCLAW_SKIP_PROVIDER_WARMUP=1)");
+    } else if let Err(err) = provider.warmup().await {
         tracing::warn!(provider = provider_name, "Provider warmup failed: {err}");
     }
 
@@ -1771,6 +1776,8 @@ async fn process_channel_message(
         msg.sender,
         truncate_with_ellipsis(&msg.content, 80)
     );
+    #[cfg(feature = "v821")]
+    eprintln!("[v821-debug][msg] step:record_event");
     runtime_trace::record_event(
         "channel_message_inbound",
         Some(msg.channel.as_str()),
@@ -1787,6 +1794,8 @@ async fn process_channel_message(
         }),
     );
 
+    #[cfg(feature = "v821")]
+    eprintln!("[v821-debug][msg] step:hooks");
     // ── Hook: on_message_received (modifying) ────────────
     let mut msg = if let Some(hooks) = &ctx.hooks {
         match hooks.run_on_message_received(msg).await {
@@ -1800,17 +1809,27 @@ async fn process_channel_message(
         msg
     };
 
+    #[cfg(feature = "v821")]
+    eprintln!("[v821-debug][msg] step:target_channel");
     let target_channel = ctx.channels_by_name.get(&msg.channel).cloned();
+    #[cfg(feature = "v821")]
+    eprintln!("[v821-debug][msg] step:config_update");
     if let Err(err) = maybe_apply_runtime_config_update(ctx.as_ref()).await {
         tracing::warn!("Failed to apply runtime config update: {err}");
     }
+    #[cfg(feature = "v821")]
+    eprintln!("[v821-debug][msg] step:runtime_cmd_check");
     if handle_runtime_command_if_needed(ctx.as_ref(), &msg, target_channel.as_ref()).await {
         return;
     }
 
+    #[cfg(feature = "v821")]
+    eprintln!("[v821-debug][msg] step:route_selection");
     let history_key = conversation_history_key(&msg);
     let mut route = get_route_selection(ctx.as_ref(), &history_key);
 
+    #[cfg(feature = "v821")]
+    eprintln!("[v821-debug][msg] step:classify");
     // ── Query classification: override route when a rule matches ──
     if let Some(hint) = crate::agent::classifier::classify(&ctx.query_classification, &msg.content)
     {
@@ -1834,6 +1853,8 @@ async fn process_channel_message(
         }
     }
 
+    #[cfg(feature = "v821")]
+    eprintln!("[v821-debug][msg] step:get_provider");
     let runtime_defaults = runtime_defaults_snapshot(ctx.as_ref());
     let active_provider = match get_or_create_provider(ctx.as_ref(), &route.provider).await {
         Ok(provider) => provider,
@@ -1854,8 +1875,12 @@ async fn process_channel_message(
             return;
         }
     };
+    #[cfg(feature = "v821")]
+    eprintln!("[v821-debug][msg] step:provider_ok");
     if ctx.auto_save_memory && msg.content.chars().count() >= AUTOSAVE_MIN_MESSAGE_CHARS {
         let autosave_key = conversation_memory_key(&msg);
+        #[cfg(feature = "v821")]
+        eprintln!("[v821-debug][msg] step:autosave_memory");
         let _ = ctx
             .memory
             .store(
@@ -1867,6 +1892,8 @@ async fn process_channel_message(
             .await;
     }
 
+    #[cfg(feature = "v821")]
+    eprintln!("[v821-debug][msg] step:processing_start");
     println!("  ⏳ Processing message...");
     let started_at = Instant::now();
 
@@ -3574,7 +3601,10 @@ pub async fn doctor_channels(config: Config) -> Result<()> {
 /// Start all configured channels and route messages to the agent
 #[allow(clippy::too_many_lines)]
 pub async fn start_channels(config: Config) -> Result<()> {
+    tracing::info!("[v821-channels] start_channels: begin");
     let provider_name = resolved_default_provider(&config);
+    tracing::info!("[v821-channels] resolved provider: {}", provider_name);
+
     let provider_runtime_options = providers::ProviderRuntimeOptions {
         auth_profile_override: None,
         provider_api_url: config.api_url.clone(),
@@ -3585,6 +3615,7 @@ pub async fn start_channels(config: Config) -> Result<()> {
         extra_headers: config.extra_headers.clone(),
         api_path: config.api_path.clone(),
     };
+    tracing::info!("[v821-channels] creating provider...");
     let provider: Arc<dyn Provider> = Arc::from(
         create_resilient_provider_nonblocking(
             &provider_name,
@@ -3595,14 +3626,22 @@ pub async fn start_channels(config: Config) -> Result<()> {
         )
         .await?,
     );
+    tracing::info!("[v821-channels] provider created");
 
     // Warm up the provider connection pool (TLS handshake, DNS, HTTP/2 setup)
     // so the first real message doesn't hit a cold-start timeout.
-    if let Err(e) = provider.warmup().await {
+    // Skip warmup on V821 RISC-V 32-bit devices due to potential TLS/async compatibility issues
+    let skip_warmup = std::env::var("ZEROCLAW_SKIP_PROVIDER_WARMUP").as_deref() == Ok("1");
+    if skip_warmup {
+        tracing::info!("Skipping provider warmup (ZEROCLAW_SKIP_PROVIDER_WARMUP=1)");
+    } else if let Err(e) = provider.warmup().await {
         tracing::warn!("Provider warmup failed (non-fatal): {e}");
     }
+    tracing::info!("[v821-channels] warmup done");
 
+    tracing::info!("[v821-channels] config_file_stamp...");
     let initial_stamp = config_file_stamp(&config.config_path).await;
+    tracing::info!("[v821-channels] runtime_config_store...");
     {
         let mut store = runtime_config_store()
             .lock()
@@ -3615,16 +3654,20 @@ pub async fn start_channels(config: Config) -> Result<()> {
             },
         );
     }
-
+    tracing::info!("[v821-channels] create_observer...");
     let observer: Arc<dyn Observer> =
         Arc::from(observability::create_observer(&config.observability));
+    tracing::info!("[v821-channels] create_runtime...");
     let runtime: Arc<dyn runtime::RuntimeAdapter> =
         Arc::from(runtime::create_runtime(&config.runtime)?);
+    tracing::info!("[v821-channels] SecurityPolicy...");
     let security = Arc::new(SecurityPolicy::from_config(
         &config.autonomy,
         &config.workspace_dir,
     ));
+    tracing::info!("[v821-channels] resolved_default_model...");
     let model = resolved_default_model(&config);
+    tracing::info!("[v821-channels] create_memory...");
     let temperature = config.default_temperature;
     let mem: Arc<dyn Memory> = Arc::from(memory::create_memory_with_storage_and_routes(
         &config.memory,
@@ -3633,6 +3676,7 @@ pub async fn start_channels(config: Config) -> Result<()> {
         &config.workspace_dir,
         config.api_key.as_deref(),
     )?);
+    tracing::info!("[v821-channels] memory created");
     let (composio_key, composio_entity_id) = if config.composio.enabled {
         (
             config.composio.api_key.as_deref(),

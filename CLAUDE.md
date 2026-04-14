@@ -101,3 +101,5 @@ Branch/commit/PR rules:
 
 ## 代码修改
 - 把v821相关的编译脚本,运行脚本等定制代码,统一放到 zeroclaw/v821目录, 尽量少修改框架原始代码，优先通过参数传入，更上层的使用方面进行适配，减少后续维护成本
+- 每次遇到问题，先结合之前的问题总结文档：v821-crash-analysis-2026-03-22.md 进行分析，例如tls, agent配置等，解决问题后，要再归档到这个文档，方便后续排查
+- 挂载SSHFS：/Users/tubao/work/ubuntu/start_ubuntu_sshfs.sh
